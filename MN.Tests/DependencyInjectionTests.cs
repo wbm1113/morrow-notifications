@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace MN.Tests;
@@ -97,14 +98,29 @@ public class DependencyInjectionTests
     private sealed class CapturingWebApplicationFactory(Action<IServiceCollection> onConfigure)
         : WebApplicationFactory<Program>
     {
+        private readonly string _connectionString =
+            $"Data Source=di-test-{Guid.NewGuid():N};Mode=Memory;Cache=Shared";
+        private SqliteConnection? _keepAlive;
+
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
+            // Keep one connection open for the factory's lifetime so the shared-cache
+            // in-memory database isn't destroyed between EnsureCreated() and the
+            // Tenants query that runs during app startup.
+            _keepAlive = new SqliteConnection(_connectionString);
+            _keepAlive.Open();
+
             builder.ConfigureServices(onConfigure);
 
             // Point at an in-memory DB so no file is created on disk.
-            builder.UseSetting(
-                "ConnectionStrings:DefaultConnection",
-                $"Data Source=di-test-{Guid.NewGuid():N}.db;Mode=Memory;Cache=Shared");
+            builder.UseSetting("ConnectionStrings:DefaultConnection", _connectionString);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                _keepAlive?.Dispose();
+            base.Dispose(disposing);
         }
     }
 }
