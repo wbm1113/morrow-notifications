@@ -1,0 +1,12 @@
+@host = http://localhost:5252
+
+# Set @tenantId to filter dead letters to a specific tenant.
+@tenantId = <paste-tenant-id-here>
+
+### Get all dead-lettered messages (all tenants)
+GET {{host}}/api/dead-letters
+
+###
+
+### Get dead-lettered messages for a specific tenant
+GET {{host}}/api/dead-letters/tenant/{{tenantId}}

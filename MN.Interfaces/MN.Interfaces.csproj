@@ -1,0 +1,19 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MN.Entities\MN.Entities.csproj" />
+    <ProjectReference Include="..\MN.Models\MN.Models.csproj" />
+    <ProjectReference Include="..\MN.Core\MN.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Threading.RateLimiting" Version="10.0.8" />
+  </ItemGroup>
+
+</Project>

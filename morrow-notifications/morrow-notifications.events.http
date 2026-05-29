@@ -1,0 +1,38 @@
+@host = http://localhost:5252
+
+# Set @tenantId to a tenant that has matching routing rules configured.
+@tenantId = <paste-tenant-id-here>
+
+### Ingest an event — dispatched if a matching rule exists
+POST {{host}}/api/events
+Content-Type: application/json
+
+{
+  "tenantId": "{{tenantId}}",
+  "eventType": "order.created",
+  "payload": "{\"orderId\": \"ord-001\", \"amount\": 49.99}"
+}
+
+###
+
+### Ingest an event with no matching rule — will be dead-lettered
+POST {{host}}/api/events
+Content-Type: application/json
+
+{
+  "tenantId": "{{tenantId}}",
+  "eventType": "unrouted.event",
+  "payload": "{\"note\": \"no routing rule for this event type\"}"
+}
+
+###
+
+### Ingest with an unknown tenant — 404
+POST {{host}}/api/events
+Content-Type: application/json
+
+{
+  "tenantId": "00000000-0000-0000-0000-000000000000",
+  "eventType": "order.created",
+  "payload": "{}"
+}

@@ -1,0 +1,82 @@
+@host = http://localhost:5252
+
+# Set these from the tenants file before running.
+@tenantId = <paste-tenant-id-here>
+@ruleId = <paste-rule-id-here>
+
+### Get all rules for a tenant
+GET {{host}}/api/tenants/{{tenantId}}/rules
+
+###
+
+### Get a specific rule
+GET {{host}}/api/tenants/{{tenantId}}/rules/{{ruleId}}
+
+###
+
+### Create a rule — order.created → Slack
+POST {{host}}/api/tenants/{{tenantId}}/rules
+Content-Type: application/json
+
+{
+  "eventType": "order.created",
+  "channelType": "slack"
+}
+
+###
+
+### Create a rule — order.created → Teams (fan-out: same event type, second channel)
+POST {{host}}/api/tenants/{{tenantId}}/rules
+Content-Type: application/json
+
+{
+  "eventType": "order.created",
+  "channelType": "teams"
+}
+
+###
+
+### Create a rule — payment.failed → Slack
+POST {{host}}/api/tenants/{{tenantId}}/rules
+Content-Type: application/json
+
+{
+  "eventType": "payment.failed",
+  "channelType": "slack"
+}
+
+###
+
+### Update a rule — change event type and channel
+PATCH {{host}}/api/tenants/{{tenantId}}/rules/{{ruleId}}
+Content-Type: application/json
+
+{
+  "eventType": "order.updated",
+  "channelType": "teams"
+}
+
+###
+
+### Disable a rule
+PATCH {{host}}/api/tenants/{{tenantId}}/rules/{{ruleId}}
+Content-Type: application/json
+
+{
+  "isActive": false
+}
+
+###
+
+### Re-enable a rule
+PATCH {{host}}/api/tenants/{{tenantId}}/rules/{{ruleId}}
+Content-Type: application/json
+
+{
+  "isActive": true
+}
+
+###
+
+### Delete a rule
+DELETE {{host}}/api/tenants/{{tenantId}}/rules/{{ruleId}}

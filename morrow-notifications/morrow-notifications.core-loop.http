@@ -1,0 +1,35 @@
+@host = http://localhost:5252
+
+### 1. Create a tenant
+# Copy the returned "id" into @tenantId below.
+POST {{host}}/api/tenants
+Content-Type: application/json
+
+{
+  "name": "Acme Corp",
+  "rateLimitPerMinute": 100
+}
+
+###
+
+@tenantId = <paste-tenant-id-here>
+
+### 2. Create a routing rule for that tenant
+# Maps order.created events to the Slack channel.
+POST {{host}}/api/tenants/{{tenantId}}/rules
+Content-Type: application/json
+
+{
+  "eventType": "order.created",
+  "channelType": "slack"
+}
+
+### 3. Ingest an event — triggers the rule above
+POST {{host}}/api/events
+Content-Type: application/json
+
+{
+  "tenantId": "{{tenantId}}",
+  "eventType": "order.created",
+  "payload": "{\"orderId\": \"ord-001\", \"amount\": 49.99}"
+}

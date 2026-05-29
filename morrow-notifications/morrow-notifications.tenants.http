@@ -1,0 +1,59 @@
+@host = http://localhost:5252
+
+# Set @tenantId after running "Create a tenant" below.
+@tenantId = <paste-tenant-id-here>
+
+### Get all tenants
+GET {{host}}/api/tenants
+
+###
+
+### Get tenant by ID
+GET {{host}}/api/tenants/{{tenantId}}
+
+###
+
+### Create a tenant
+POST {{host}}/api/tenants
+Content-Type: application/json
+
+{
+  "name": "Acme Corp",
+  "rateLimitPerMinute": 100
+}
+
+###
+
+### Update tenant — change name and rate limit
+PATCH {{host}}/api/tenants/{{tenantId}}
+Content-Type: application/json
+
+{
+  "name": "Acme Corp (updated)",
+  "rateLimitPerMinute": 200
+}
+
+###
+
+### Deactivate a tenant
+PATCH {{host}}/api/tenants/{{tenantId}}
+Content-Type: application/json
+
+{
+  "isActive": false
+}
+
+###
+
+### Reactivate a tenant
+PATCH {{host}}/api/tenants/{{tenantId}}
+Content-Type: application/json
+
+{
+  "isActive": true
+}
+
+###
+
+### Delete a tenant
+DELETE {{host}}/api/tenants/{{tenantId}}
