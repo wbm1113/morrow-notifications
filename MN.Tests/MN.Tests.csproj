@@ -21,6 +21,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\morrow-notifications\morrow-notifications.csproj" />
+    <ProjectReference Include="..\MN.Core\MN.Core.csproj" />
+    <ProjectReference Include="..\MN.DAL\MN.DAL.csproj" />
     <ProjectReference Include="..\MN.Entities\MN.Entities.csproj" />
   </ItemGroup>
 

@@ -1,12 +1,6 @@
 namespace MN.Models;
 
-/// <summary>
-/// In-flight view of a message as it moves through the queue, processor, and channel layers.
-/// Kept separate from the EF entity so the EF change-tracker and nav properties
-/// never leak outside the DAL boundary.
-/// Class (not record) because DeliveryAttempts is mutated in place during processing;
-/// value semantics and structural equality would be misleading for a long-lived mutable object.
-/// </summary>
+
 public class ProcessingMessage(
     Guid Id,
     Guid TenantId,
@@ -23,7 +17,10 @@ public class ProcessingMessage(
     public DateTime CreatedAt { get; } = CreatedAt;
 
     /// <summary>
-    /// Incremented per delivery attempt. Not persisted — mirrors ASB DeliveryCount semantics.
+    /// Incremented per delivery attempt. On ASB, initialize from
+    /// <c>ServiceBusReceivedMessage.DeliveryCount</c> when building this model.
+    /// <see cref="Id"/> is the idempotency key for DB upserts (set ASB MessageId to the same
+    /// value on send for correlation; broker envelope id is not the business message identity).
     /// </summary>
     public int DeliveryAttempts { get; set; } = 0;
 }

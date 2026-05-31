@@ -19,6 +19,14 @@ public class RoutingRuleRepository(AppDbContext db) : IRoutingRuleRepository
             .Where(r => r.TenantId == tenantId && r.IsActive && r.EventType == eventType)
             .ToListAsync(ct);
 
+    public async Task<RoutingRule?> GetByEventTypeAndChannelAsync(
+        Guid tenantId, string eventType, string channelType, CancellationToken ct) =>
+        await db.RoutingRules
+            .FirstOrDefaultAsync(r =>
+                r.TenantId == tenantId
+                && r.EventType == eventType
+                && r.ChannelType == channelType, ct);
+
     public async Task<RoutingRule> CreateAsync(RoutingRule rule, CancellationToken ct)
     {
         db.RoutingRules.Add(rule);

@@ -21,9 +21,7 @@
     <ProjectReference Include="..\MN.Entities\MN.Entities.csproj" />
     <ProjectReference Include="..\MN.Models\MN.Models.csproj" />
     <ProjectReference Include="..\MN.Interfaces\MN.Interfaces.csproj" />
-    <ProjectReference Include="..\MN.Ingestion\MN.Ingestion.csproj" />
-    <ProjectReference Include="..\MN.Processing\MN.Processing.csproj" />
-    <ProjectReference Include="..\MN.Dispatching\MN.Dispatching.csproj" />
+    <ProjectReference Include="..\MN.BusinessLogic\MN.BusinessLogic.csproj" />
   </ItemGroup>
 
 </Project>

@@ -4,6 +4,8 @@ using MN.Interfaces;
 
 namespace MN.DAL;
 
+// intentionally bare bones.  cloud queue provider should be handling this.
+
 public class InMemoryDeadLetterQueue : IDeadLetterQueue
 {
     private readonly ConcurrentBag<DeadLetterMessage> _messages = new();

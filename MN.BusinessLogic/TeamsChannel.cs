@@ -4,7 +4,7 @@ using MN.Entities;
 using MN.Interfaces;
 using MN.Models;
 
-namespace MN.Dispatching;
+namespace MN.BusinessLogic;
 
 /// <summary>
 /// Stub Teams channel. Replace the body of SendAsync with an Adaptive Card POST
@@ -14,11 +14,11 @@ public class TeamsChannel(ILogger<TeamsChannel> logger) : INotificationChannel
 {
     public string ChannelType => ChannelTypes.Teams;
 
-    public Task SendAsync(ProcessingMessage message, RoutingRule rule, CancellationToken ct)
+    public Task SendAsync(DispatchMessage dispatch, RoutingRule rule, CancellationToken ct)
     {
         logger.LogInformation(
-            "[TEAMS CHANNEL - STUB] TenantId={TenantId} MessageId={MessageId} EventType={EventType}",
-            message.TenantId, message.Id, message.EventType);
+            "[TEAMS CHANNEL - STUB] TenantId={TenantId} DispatchId={DispatchId} EventType={EventType}",
+            dispatch.TenantId, dispatch.Id, dispatch.EventType);
 
         return Task.CompletedTask;
     }

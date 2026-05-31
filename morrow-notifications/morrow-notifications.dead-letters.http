@@ -4,6 +4,8 @@
 @tenantId = <paste-tenant-id-here>
 
 ### Get all dead-lettered messages (all tenants)
+# Event-level DLQ: no rules, inactive tenant (routing stage) — dispatchId is null.
+# Dispatch-level DLQ: channel send failed (delivery stage) — includes dispatchId and channelType.
 GET {{host}}/api/dead-letters
 
 ###

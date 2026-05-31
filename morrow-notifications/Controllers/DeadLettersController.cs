@@ -19,5 +19,5 @@ public class DeadLettersController(IDeadLetterQueue deadLetterQueue) : Controlle
         Ok(deadLetterQueue.GetByTenant(tenantId).Select(ToResponse));
 
     private static DeadLetterResponse ToResponse(MN.Models.DeadLetterMessage d) =>
-        new(d.Id, d.TenantId, d.OriginalMessageId, d.EventType, d.Payload, d.FailureReason, d.FailedAt);
+        new(d.Id, d.TenantId, d.OriginalMessageId, d.DispatchId, d.ChannelType, d.EventType, d.Payload, d.FailureReason, d.FailedAt);
 }

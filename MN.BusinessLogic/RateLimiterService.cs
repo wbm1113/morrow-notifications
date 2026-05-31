@@ -1,35 +1,24 @@
 using System.Threading.RateLimiting;
+using MN.Core;
 using MN.Interfaces;
 
-namespace MN.Ingestion;
+namespace MN.BusinessLogic;
 
 public class RateLimiterService : IRateLimiterService, IDisposable
 {
     private readonly Dictionary<Guid, (SlidingWindowRateLimiter Limiter, int RequestsPerMinute)> _limiters = new();
-
-    // ReaderWriterLockSlim allows concurrent reads on the hot path (TryAcquire / IsKnownTenant)
-    // while serialising writes (ConfigureTenant / RemoveTenant / Dispose).
-
     private readonly ReaderWriterLockSlim _rwLock = new(LockRecursionPolicy.NoRecursion);
 
-    public bool IsKnownTenant(Guid tenantId)
-    {
-        _rwLock.EnterReadLock();
-        try { return _limiters.ContainsKey(tenantId); }
-        finally { _rwLock.ExitReadLock(); }
-    }
-
-    public RateLimitLease TryAcquire(Guid tenantId)
+    public AcquireResult TryAcquire(Guid tenantId)
     {
         _rwLock.EnterReadLock();
         try
         {
             if (!_limiters.TryGetValue(tenantId, out var entry))
-                return new DeniedLease();
+                return AcquireResult.TenantNotFound;
 
-            // Read lock is still held here, so RemoveTenant / ConfigureTenant cannot
-            // dispose this limiter until we exit — ObjectDisposedException is no longer possible.
-            return entry.Limiter.AttemptAcquire();
+            using var lease = entry.Limiter.AttemptAcquire();
+            return lease.IsAcquired ? AcquireResult.Acquired : AcquireResult.RateLimitExceeded;
         }
         finally
         {
@@ -53,7 +42,7 @@ public class RateLimiterService : IRateLimiterService, IDisposable
             {
                 PermitLimit = requestsPerMinute,
                 Window = TimeSpan.FromMinutes(1),
-                SegmentsPerWindow = 6,             // 10-second resolution
+                SegmentsPerWindow = 6,
                 QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
                 QueueLimit = 0
             });

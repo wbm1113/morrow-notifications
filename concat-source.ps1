@@ -3,7 +3,10 @@
 $output = "concat-source.txt"
 $root   = $PSScriptRoot
 
-Get-ChildItem -Path $root -Recurse -Filter "*.cs" |
+$sections = @()
+
+# C# source files
+$sections += Get-ChildItem -Path $root -Recurse -Filter "*.cs" |
     Where-Object { $_.FullName -notmatch "\\(obj|bin)\\" } |
     Sort-Object FullName |
     ForEach-Object {
@@ -13,7 +16,25 @@ Get-ChildItem -Path $root -Recurse -Filter "*.cs" |
         "// ============================================================"
         Get-Content $_.FullName
         ""
-    } |
-    Set-Content -Path (Join-Path $root $output) -Encoding UTF8
+    }
+
+# Markdown docs: README, DESIGN, and all ADRs
+$mdFiles = @(
+    (Join-Path $root "README.md"),
+    (Join-Path $root "DESIGN.md")
+) + (Get-ChildItem -Path (Join-Path $root "docs\adrs") -Filter "*.md" | Sort-Object Name | ForEach-Object { $_.FullName })
+
+foreach ($mdFile in $mdFiles) {
+    if (Test-Path $mdFile) {
+        $relativePath = $mdFile.Substring($root.Length + 1)
+        $sections += "// ============================================================"
+        $sections += "// $relativePath"
+        $sections += "// ============================================================"
+        $sections += Get-Content $mdFile
+        $sections += ""
+    }
+}
+
+$sections | Set-Content -Path (Join-Path $root $output) -Encoding UTF8
 
 Write-Host "Written to $output ($((Get-Item (Join-Path $root $output)).Length) bytes)"

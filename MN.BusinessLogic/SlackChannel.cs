@@ -4,7 +4,7 @@ using MN.Entities;
 using MN.Interfaces;
 using MN.Models;
 
-namespace MN.Dispatching;
+namespace MN.BusinessLogic;
 
 /// <summary>
 /// Stub Slack channel. Replace the body of SendAsync with the Slack Web API call
@@ -14,11 +14,11 @@ public class SlackChannel(ILogger<SlackChannel> logger) : INotificationChannel
 {
     public string ChannelType => ChannelTypes.Slack;
 
-    public Task SendAsync(ProcessingMessage message, RoutingRule rule, CancellationToken ct)
+    public Task SendAsync(DispatchMessage dispatch, RoutingRule rule, CancellationToken ct)
     {
         logger.LogInformation(
-            "[SLACK CHANNEL - STUB] TenantId={TenantId} MessageId={MessageId} EventType={EventType}",
-            message.TenantId, message.Id, message.EventType);
+            "[SLACK CHANNEL - STUB] TenantId={TenantId} DispatchId={DispatchId} EventType={EventType}",
+            dispatch.TenantId, dispatch.Id, dispatch.EventType);
 
         return Task.CompletedTask;
     }

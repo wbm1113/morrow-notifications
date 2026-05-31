@@ -1,10 +1,38 @@
 # morrow-notifications
 
-## Prerequisites
+Multi-tenant notification platform — ingest events, apply per-tenant routing rules, dispatch to Slack/Teams (stub channels).
 
-- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
+## For reviewers (start here)
 
-No Docker, no external services. The datastore is a SQLite file (`morrow-notifications.db`) created automatically on first run.
+**Prerequisites:** [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) only. No Docker, no external services.
+
+**One command — build, unit tests, start API, full API smoke suite, stop API:**
+
+```powershell
+./verify.ps1
+```
+
+Mac/Linux:
+
+```bash
+chmod +x verify.sh && ./verify.sh
+```
+
+Expected output ends with `ALL CHECKS PASSED`. The PowerShell path runs **20 unit tests** plus **51 API checks**; the bash script runs the same unit tests plus a shorter curl smoke path.
+
+**Manual path** (if you prefer):
+
+```bash
+dotnet test MN.Tests/MN.Tests.csproj
+dotnet run --project morrow-notifications/morrow-notifications.csproj
+```
+
+Then either:
+
+- `./run-e2e-tests.ps1` — full API smoke suite (PowerShell), or
+- Open `morrow-notifications/morrow-notifications.core-loop.http` in VS Code ([REST Client](https://marketplace.visualstudio.com/items?itemName=humao.rest-client)) or Visual Studio and run all three requests top-to-bottom (no copy/paste — IDs chain automatically).
+
+API base URL: `http://localhost:5252`
 
 ---
 
@@ -14,57 +42,54 @@ No Docker, no external services. The datastore is a SQLite file (`morrow-notific
 dotnet run --project morrow-notifications/morrow-notifications.csproj
 ```
 
-The API starts on `http://localhost:5252`.
+SQLite database (`morrow-notifications.db`) is created automatically on first run.
 
 ---
 
 ## Exercising the API
 
-Several `.http` files are in `morrow-notifications/`. Open them natively in Visual Studio or in VS Code with the [REST Client](https://marketplace.visualstudio.com/items?itemName=humao.rest-client) extension — each request has a **Send Request** link above it.
-
 | File | Purpose |
 |---|---|
-| `morrow-notifications.core-loop.http` | The happy path: create tenant → rule → ingest. Start here. |
+| `morrow-notifications.core-loop.http` | **Start here** — self-contained happy path (tenant → rule → ingest). |
 | `morrow-notifications.tenants.http` | Full tenant CRUD including activate/deactivate. |
-| `morrow-notifications.rules.http` | Full routing rule CRUD; includes a fan-out example (same event type, two channels). |
-| `morrow-notifications.events.http` | Ingest: matched event, unrouted event (→ dead-letter), unknown tenant. |
-| `morrow-notifications.dead-letters.http` | Read dead-lettered messages, all tenants or per-tenant. |
+| `morrow-notifications.rules.http` | Full routing rule CRUD; multi-channel fan-out example. |
+| `morrow-notifications.events.http` | Ingest: matched, unrouted (→ dead-letter), unknown tenant. |
+| `morrow-notifications.dead-letters.http` | Read dead-lettered messages. |
 
-Each file has `@tenantId` (and `@ruleId` where needed) at the top — paste the IDs returned from earlier requests before running individual calls.
+Files other than `core-loop.http` use `@tenantId` / `@ruleId` placeholders at the top — paste IDs from earlier responses, or use `run-e2e-tests.ps1` / `verify.ps1` for automated coverage.
 
 ---
 
 ## Architecture
 
-See DESIGN.md.
+See [DESIGN.md](DESIGN.md). Non-obvious trade-offs are also captured in [docs/adrs/](docs/adrs/README.md).
 
 ---
 
 ## Running the Tests
 
-Four tests are in `MN.Tests/`:
-
 ```bash
 dotnet test MN.Tests/MN.Tests.csproj
 ```
 
-They spin up the real application pipeline in-process (via `WebApplicationFactory`) against an isolated per-run SQLite database and verify:
+In-process tests (via `WebApplicationFactory`) verify:
 
 - Tenant B cannot read Tenant A's routing rules
 - Tenant B's events are not dispatched by Tenant A's rules
 - Tenant A exhausting its rate limit does not block Tenant B
-- All entities with a `TenantId` property implement `ITenantScoped` (contract enforcement)
+- Partial channel failure dead-letters only the failed dispatch
+- Outbox lease claiming under concurrent publishers
 
 ---
 
 ## Known Limitations and What I'd Do Differently
 
-See DESIGN.md for the full list.
+See [DESIGN.md](DESIGN.md).
 
 ---
 
 ## AI Tools
 
-Built with **GitHub Copilot** (Claude Sonnet 4.6) throughout — architecture, scaffolding, implementation, and tests. All code was reviewed and iterated on interactively.  Opus 4.6 (or 4.7) would have likely yielded better results in a shorter time frame, but is not available on my personal Copilot plan.
+Built with **GitHub Copilot** (Claude Sonnet 4.6) throughout — architecture, scaffolding, implementation, and tests. All code was reviewed and iterated on interactively.
 
-Double-checked and polished with Gemini's 3.5 Thinking model (using concat-source.ps1).
+Double-checked and polished with Gemini's 3.5 Thinking model (using `concat-source.ps1`) along with Cursor AI.

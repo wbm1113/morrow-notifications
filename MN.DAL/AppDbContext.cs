@@ -1,4 +1,5 @@
 ﻿using Microsoft.EntityFrameworkCore;
+using MN.Core;
 using MN.Entities;
 using MN.Interfaces;
 
@@ -9,6 +10,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ITenantContext
     public DbSet<Tenant> Tenants => Set<Tenant>();
     public DbSet<RoutingRule> RoutingRules => Set<RoutingRule>();
     public DbSet<NotificationMessage> Messages => Set<NotificationMessage>();
+    public DbSet<NotificationDispatch> Dispatches => Set<NotificationDispatch>();
+    public DbSet<DispatchOutboxEntry> DispatchOutbox => Set<DispatchOutboxEntry>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -22,7 +25,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ITenantContext
         modelBuilder.Entity<RoutingRule>(e =>
         {
             e.HasKey(r => r.Id);
-            e.HasIndex(r => new { r.TenantId, r.EventType });
+            // One rule per channel per event type — bounded multi-channel fan-out per ingest.
+            e.HasIndex(r => new { r.TenantId, r.EventType, r.ChannelType }).IsUnique();
             e.Property(r => r.EventType).IsRequired().HasMaxLength(200);
             e.Property(r => r.ChannelType).IsRequired().HasMaxLength(50);
             e.HasOne(r => r.Tenant)
@@ -37,6 +41,26 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ITenantContext
             e.HasIndex(m => new { m.TenantId, m.Status });
             e.HasIndex(m => m.TenantId);
             e.Property(m => m.EventType).IsRequired().HasMaxLength(200);
+            e.Property(m => m.Payload).IsRequired().HasMaxLength(NotificationLimits.MaxPayloadLength);
+        });
+
+        modelBuilder.Entity<NotificationDispatch>(e =>
+        {
+            e.HasKey(d => d.Id);
+            e.HasIndex(d => new { d.TenantId, d.OriginalMessageId });
+            e.Property(d => d.ChannelType).IsRequired().HasMaxLength(50);
+        });
+
+        modelBuilder.Entity<DispatchOutboxEntry>(e =>
+        {
+            e.HasKey(o => o.Id);
+            e.HasIndex(o => o.PublishedAt);
+            e.HasIndex(o => o.ClaimedUntil);
+            e.Property(o => o.ClaimedBy).HasMaxLength(64);
+            e.HasIndex(o => new { o.TenantId, o.OriginalMessageId });
+            e.Property(o => o.ChannelType).IsRequired().HasMaxLength(50);
+            e.Property(o => o.EventType).IsRequired().HasMaxLength(200);
+            e.Property(o => o.Payload).IsRequired().HasMaxLength(NotificationLimits.MaxPayloadLength);
         });
 
         // Global query filters: ORM-layer tenant isolation.
@@ -54,32 +78,49 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ITenantContext
             .HasQueryFilter(m => tenantContext.IsAdminScope
                               || (tenantContext.CurrentTenantId.HasValue
                                   && m.TenantId == tenantContext.CurrentTenantId.Value));
+
+        modelBuilder.Entity<NotificationDispatch>()
+            .HasQueryFilter(d => tenantContext.IsAdminScope
+                              || (tenantContext.CurrentTenantId.HasValue
+                                  && d.TenantId == tenantContext.CurrentTenantId.Value));
     }
 
     // Mutation guard: global query filters protect reads only.
-    // This override stamps TenantId on any Added/Modified entity that carries one,
-    // so a bug in a caller that trusts a body-supplied TenantId can never produce a
-    // cross-tenant write. Only applied when a tenant scope is active (IsAdminScope is
-    // false and CurrentTenantId is set); admin paths skip stamping by not setting
-    // tenant scope.
+    // Tenant-scoped writes require CurrentTenantId (stamp TenantId from context) or
+    // IsAdminScope (cross-tenant admin). Fail closed on missing context so a new code
+    // path cannot silently persist tenant-scoped data without isolation in place.
+    public override int SaveChanges()
+    {
+        ApplyTenantMutationGuard();
+        return base.SaveChanges();
+    }
+
     public override Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)
     {
-        if (tenantContext.IsAdminScope)
-        {
-            return base.SaveChangesAsync(cancellationToken);
-        }
-
-        if (tenantContext.CurrentTenantId.HasValue)
-        {
-            foreach (var entry in ChangeTracker.Entries<ITenantScoped>())
-            {
-                if (entry.State is not (EntityState.Added or EntityState.Modified))
-                    continue;
-
-                entry.Entity.TenantId = tenantContext.CurrentTenantId.Value;
-            }
-        }
-
+        ApplyTenantMutationGuard();
         return base.SaveChangesAsync(cancellationToken);
+    }
+
+    private void ApplyTenantMutationGuard()
+    {
+        if (tenantContext.IsAdminScope)
+            return;
+
+        var tenantScopedMutations = ChangeTracker.Entries<ITenantScoped>()
+            .Where(e => e.State is EntityState.Added or EntityState.Modified)
+            .ToList();
+
+        if (tenantScopedMutations.Count == 0)
+            return;
+
+        if (!tenantContext.CurrentTenantId.HasValue)
+        {
+            throw new InvalidOperationException(
+                "Cannot save tenant-scoped entities without ITenantContext.CurrentTenantId set. " +
+                "Set CurrentTenantId before writing tenant-scoped data, or IsAdminScope for cross-tenant admin operations.");
+        }
+
+        foreach (var entry in tenantScopedMutations)
+            entry.Entity.TenantId = tenantContext.CurrentTenantId.Value;
     }
 }

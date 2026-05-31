@@ -51,12 +51,22 @@ public class RoutingRulesController(
         if (!_validChannelTypes.Contains(request.ChannelType))
             return BadRequest(new { error = $"ChannelType must be one of: {string.Join(", ", _validChannelTypes)}." });
 
+        var eventType = request.EventType.Trim();
+        var channelType = request.ChannelType.ToLowerInvariant();
+        if (await ruleRepository.GetByEventTypeAndChannelAsync(tenantId, eventType, channelType, ct) is not null)
+        {
+            return Conflict(new
+            {
+                error = $"A routing rule for event type '{eventType}' and channel '{channelType}' already exists for this tenant."
+            });
+        }
+
         var rule = new RoutingRule
         {
             Id = Guid.NewGuid(),
             TenantId = tenantId,
-            EventType = request.EventType.Trim(),
-            ChannelType = request.ChannelType.ToLowerInvariant(),
+            EventType = eventType,
+            ChannelType = channelType,
             IsActive = true,
             CreatedAt = DateTime.UtcNow,
             UpdatedAt = DateTime.UtcNow
@@ -75,13 +85,26 @@ public class RoutingRulesController(
         var rule = await ruleRepository.GetByIdAsync(tenantId, ruleId, ct);
         if (rule is null) return NotFound();
 
-        if (request.EventType is not null) rule.EventType = request.EventType.Trim();
-        if (request.ChannelType is not null)
+        if (request.ChannelType is not null && !_validChannelTypes.Contains(request.ChannelType))
+            return BadRequest(new { error = $"ChannelType must be one of: {string.Join(", ", _validChannelTypes)}." });
+
+        var eventType = request.EventType?.Trim() ?? rule.EventType;
+        var channelType = request.ChannelType?.ToLowerInvariant() ?? rule.ChannelType;
+
+        if (request.EventType is not null || request.ChannelType is not null)
         {
-            if (!_validChannelTypes.Contains(request.ChannelType))
-                return BadRequest(new { error = $"ChannelType must be one of: {string.Join(", ", _validChannelTypes)}." });
-            rule.ChannelType = request.ChannelType.ToLowerInvariant();
+            var existing = await ruleRepository.GetByEventTypeAndChannelAsync(tenantId, eventType, channelType, ct);
+            if (existing is not null && existing.Id != ruleId)
+            {
+                return Conflict(new
+                {
+                    error = $"A routing rule for event type '{eventType}' and channel '{channelType}' already exists for this tenant."
+                });
+            }
         }
+
+        if (request.EventType is not null) rule.EventType = eventType;
+        if (request.ChannelType is not null) rule.ChannelType = channelType;
         if (request.IsActive is not null) rule.IsActive = request.IsActive.Value;
 
         var updated = await ruleRepository.UpdateAsync(rule, ct);

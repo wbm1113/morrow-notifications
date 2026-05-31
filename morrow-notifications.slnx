@@ -1,12 +1,10 @@
 <Solution>
+  <Project Path="MN.BusinessLogic/MN.BusinessLogic.csproj" />
   <Project Path="MN.Core/MN.Core.csproj" />
   <Project Path="MN.DAL/MN.DAL.csproj" />
-  <Project Path="MN.Dispatching/MN.Dispatching.csproj" />
   <Project Path="MN.Entities/MN.Entities.csproj" />
-  <Project Path="MN.Ingestion/MN.Ingestion.csproj" />
   <Project Path="MN.Interfaces/MN.Interfaces.csproj" />
   <Project Path="MN.Models/MN.Models.csproj" />
-  <Project Path="MN.Processing/MN.Processing.csproj" />
   <Project Path="morrow-notifications/morrow-notifications.csproj" />
   <Project Path="MN.Tests/MN.Tests.csproj" />
 </Solution>

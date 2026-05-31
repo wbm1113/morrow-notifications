@@ -6,5 +6,5 @@ namespace MN.Interfaces;
 public interface INotificationChannel
 {
     string ChannelType { get; }
-    Task SendAsync(ProcessingMessage message, RoutingRule rule, CancellationToken ct);
+    Task SendAsync(DispatchMessage dispatch, RoutingRule rule, CancellationToken ct);
 }

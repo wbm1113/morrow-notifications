@@ -5,5 +5,5 @@ namespace MN.Interfaces;
 
 public interface IMessageDispatcher
 {
-    Task DispatchAsync(ProcessingMessage message, IEnumerable<RoutingRule> matchedRules, CancellationToken ct);
+    Task DispatchAsync(DispatchMessage dispatch, RoutingRule rule, CancellationToken ct);
 }

@@ -1,7 +1,10 @@
 @host = http://localhost:5252
 
+# Self-contained happy path — no copy/paste. Run requests top-to-bottom in VS Code REST Client
+# or Visual Studio (.http support). Allow ~2s after step 3 for background workers.
+
 ### 1. Create a tenant
-# Copy the returned "id" into @tenantId below.
+# @name createTenant
 POST {{host}}/api/tenants
 Content-Type: application/json
 
@@ -12,7 +15,7 @@ Content-Type: application/json
 
 ###
 
-@tenantId = <paste-tenant-id-here>
+@tenantId = {{createTenant.response.body.$.id}}
 
 ### 2. Create a routing rule for that tenant
 # Maps order.created events to the Slack channel.
@@ -24,7 +27,8 @@ Content-Type: application/json
   "channelType": "slack"
 }
 
-### 3. Ingest an event — triggers the rule above
+### 3. Ingest an event
+# Event queue → routing worker → dispatch queue → delivery worker → Slack.
 POST {{host}}/api/events
 Content-Type: application/json
 

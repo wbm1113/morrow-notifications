@@ -3,7 +3,7 @@
 # Set @tenantId to a tenant that has matching routing rules configured.
 @tenantId = <paste-tenant-id-here>
 
-### Ingest an event — dispatched if a matching rule exists
+### Ingest an event — routing creates one dispatch item per matching rule
 POST {{host}}/api/events
 Content-Type: application/json
 
@@ -15,7 +15,7 @@ Content-Type: application/json
 
 ###
 
-### Ingest an event with no matching rule — will be dead-lettered
+### Ingest an event with no matching rule — event-level dead letter (routing stage)
 POST {{host}}/api/events
 Content-Type: application/json
 
@@ -27,7 +27,19 @@ Content-Type: application/json
 
 ###
 
-### Ingest with an unknown tenant — 404
+### Ingest with an unknown tenant — 404 (never enqueued)
+POST {{host}}/api/events
+Content-Type: application/json
+
+{
+  "tenantId": "11111111-1111-1111-1111-111111111111",
+  "eventType": "order.created",
+  "payload": "{}"
+}
+
+###
+
+### Empty tenantId — 400 (validation)
 POST {{host}}/api/events
 Content-Type: application/json
 

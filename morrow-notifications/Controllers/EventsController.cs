@@ -1,4 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
+using MN.BusinessLogic;
+using MN.Core;
 using MN.Interfaces;
 using MN.Models;
 
@@ -6,9 +8,7 @@ namespace morrow_notifications.Controllers;
 
 [ApiController]
 [Route("api/events")]
-public class EventsController(
-    IIngestionService ingestionService,
-    IRateLimiterService rateLimiterService) : ControllerBase
+public class EventsController(IIngestionService ingestionService) : ControllerBase
 {
     [HttpPost]
     public async Task<IActionResult> Ingest([FromBody] IngestEventRequest request, CancellationToken ct)
@@ -22,19 +22,18 @@ public class EventsController(
         if (string.IsNullOrWhiteSpace(request.Payload))
             return BadRequest(new { error = "Payload is required." });
 
-        if (!rateLimiterService.IsKnownTenant(request.TenantId))
-            return NotFound(new { error = $"Tenant '{request.TenantId}' not found." });
-
-        using var lease = rateLimiterService.TryAcquire(request.TenantId);
-        if (!lease.IsAcquired)
-        {
-            return StatusCode(429, new { error = "Rate limit exceeded for this tenant." });
-        }
+        if (request.Payload.Length > NotificationLimits.MaxPayloadLength)
+            return BadRequest(new { error = $"Payload exceeds maximum length of {NotificationLimits.MaxPayloadLength} characters." });
 
         try
         {
+            // -> IngestionService
             var result = await ingestionService.IngestAsync(request, ct);
             return Accepted(result);
+        }
+        catch (RateLimitExceededException ex)
+        {
+            return StatusCode(429, new { error = ex.Message });
         }
         catch (KeyNotFoundException ex)
         {

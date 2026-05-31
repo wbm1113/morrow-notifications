@@ -25,13 +25,24 @@ Content-Type: application/json
 
 ###
 
-### Create a rule — order.created → Teams (fan-out: same event type, second channel)
+### Create a rule — order.created → Teams (multi-channel: two dispatch queue items per ingest)
 POST {{host}}/api/tenants/{{tenantId}}/rules
 Content-Type: application/json
 
 {
   "eventType": "order.created",
   "channelType": "teams"
+}
+
+###
+
+### Duplicate channel for same event type — expect 409 Conflict
+POST {{host}}/api/tenants/{{tenantId}}/rules
+Content-Type: application/json
+
+{
+  "eventType": "order.created",
+  "channelType": "slack"
 }
 
 ###

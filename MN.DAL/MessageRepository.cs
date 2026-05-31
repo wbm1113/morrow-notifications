@@ -14,6 +14,24 @@ public class MessageRepository(AppDbContext db) : IMessageRepository
         return message;
     }
 
+    public async Task EnsureProcessingAsync(NotificationMessage message, CancellationToken ct)
+    {
+        var existing = await db.Messages
+            .FirstOrDefaultAsync(m => m.TenantId == message.TenantId && m.Id == message.Id, ct);
+
+        if (existing is null)
+        {
+            db.Messages.Add(message);
+        }
+        else
+        {
+            existing.Status = MessageStatus.Processing;
+            existing.FailureReason = null;
+        }
+
+        await db.SaveChangesAsync(ct);
+    }
+
     public async Task<NotificationMessage?> GetByIdAsync(Guid tenantId, Guid messageId, CancellationToken ct) =>
         await db.Messages.FirstOrDefaultAsync(m => m.TenantId == tenantId && m.Id == messageId, ct);
 
