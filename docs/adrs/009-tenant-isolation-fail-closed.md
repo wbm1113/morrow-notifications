@@ -23,9 +23,15 @@ Each processor groups work by tenant, opens a fresh DI scope, sets `CurrentTenan
 
 **Exception:** `DispatchOutboxEntry` has **no** query filter—the publisher drains unpublished rows across tenants ([ADR 004](004-outbox-without-tenant-query-filter.md)). Rows are still tenant-stamped; writes use `CurrentTenantId` per group.
 
-### Not chosen: schema-per-tenant
+### Alternatives considered (not chosen as default)
 
-Would complicate migrations, provisioning, and every query for a router serving many small tenants—unnecessary at this scale.
+| Approach | Why not default |
+|----------|-----------------|
+| **Schema-per-tenant** | Every migration, provision, and query becomes tenant-aware; heavy for a router serving many small tenants. |
+| **Database-per-tenant** | Stronger isolation, but same provisioning/ops scaling problem at high tenant count. |
+| **Deployment-per-tenant (IaC)** | Same app can run on a dedicated stack (own compute, DB, Service Bus, secrets) provisioned from a template. Viable for **enterprise customers** who contract and pay for hard isolation—not the product default. Ops and cost scale with tenant count; shared pool + row-level guards is the right baseline. |
+
+This codebase targets the **shared** model. Dedicated IaC is a back-pocket **tier escalation** (compliance, data residency, noisy-neighbor at infra layer), not a rewrite—same containers, different boundary.
 
 ### `IsAdminScope`
 

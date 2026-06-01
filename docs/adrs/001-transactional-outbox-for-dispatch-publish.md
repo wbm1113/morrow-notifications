@@ -31,9 +31,23 @@ Without an outbox, routing might:
 
 Dispatch Id is deterministic from `(OriginalMessageId, RuleId)` so event redelivery does not create duplicate rows for channels that already succeeded.
 
+## Why outbox claiming (`ClaimedUntil` / `ClaimedBy`)
+
+The publisher is designed to **scale horizontally** — multiple `DispatchOutboxPublisherService` instances can drain the same outbox table. Without a claim step, two instances could read the same unpublished rows in the same poll window and both enqueue them, amplifying duplicates beyond the crash/republish case we already tolerate.
+
+**Claim before enqueue:**
+
+1. `TryClaimUnpublishedAcrossTenantsAsync` atomically sets `ClaimedUntil` (30s lease) and `ClaimedBy` (instance id) on a batch of rows via `ExecuteUpdateAsync`.
+2. Only that instance enqueues and calls `MarkPublishedAsync`, which requires matching `ClaimedBy` — another worker cannot mark rows it did not claim.
+3. On success, `PublishedAt` is set and the lease fields are cleared.
+
+**If a publisher crashes mid-batch**, the lease expires and another instance can reclaim the row. Until then, the row is skipped by the claim query (`ClaimedUntil == null || ClaimedUntil < now`), avoiding concurrent double-publish while work is in flight.
+
+This is separate from the transactional outbox *write* at routing time; it addresses **multi-publisher concurrency** at the drain step.
+
 ## Publish step: not atomic with the broker
 
-The publisher **claims** rows with a short lease (`ClaimedUntil` / `ClaimedBy`), **enqueues**, then sets `PublishedAt`. Only one publisher instance can claim a given row at a time; expired leases are reclaimable after a crash.
+The publisher **claims** rows (see above), **enqueues**, then sets `PublishedAt`.
 
 Enqueue and DB mark still cannot be one transaction with Azure Service Bus (or our in-memory queue).
 
