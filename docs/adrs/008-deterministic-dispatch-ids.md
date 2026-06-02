@@ -45,5 +45,5 @@ This was a pragmatic choice for the time budget: the schema already uses `Guid` 
 ## Consequences
 
 - **Pros:** Idempotent fan-out on event retry; no duplicate rows for completed channels; dispatch Id doubles as correlation id end-to-end.
-- **Cons:** Id is not a sequential or human-readable identifier; rule change semantics (same rule Id, different config) still reuse the same dispatch row.
+- **Cons:** Id is not a sequential or human-readable identifier; rule change semantics (same rule Id, different config) still reuse the same dispatch row (i.e., updating the rule and re-running the message wouldn't work).
 - **Related:** Does not solve post-send duplicate delivery ([ADR 002](002-at-least-once-delivery.md))—that is a delivery-layer concern.

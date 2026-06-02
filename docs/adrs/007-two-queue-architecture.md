@@ -19,8 +19,8 @@ Between them: transactional outbox + DB (`NotificationMessage`, `NotificationDis
 
 ## Why not one queue?
 
-- **Separation of concerns:** routing (DB-heavy, rule matching) vs delivery (HTTP-heavy, channel retries).
 - **Independent failure domains:** routing failure dead-letters the event; delivery failure dead-letters one dispatch—other channels for the same event continue.
+- **Separation of concerns:** routing (DB-heavy, rule matching) vs delivery (HTTP-heavy, channel retries).
 - **Independent scaling:** scale routing workers vs delivery workers (ASB: separate processors / session handlers).
 - **Different retry semantics:** event routing retries (max 3) vs dispatch delivery retries (max 3) vs channel inline retries (max 2)—see [ADR 003](003-dispatch-retry-layers-and-failed-status.md).
 - **Outbox fits naturally** between “fan-out decided” and “send to channel.”

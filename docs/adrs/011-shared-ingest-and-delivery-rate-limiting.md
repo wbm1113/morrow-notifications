@@ -17,7 +17,7 @@ Fan-out multiplies pressure: one ingested event can produce multiple dispatch it
 
 **Single shared limiter per tenant** — demo simplicity, one knob on `Tenant.RateLimitPerMinute`.
 
-Deferral duration when delivery is rate-limited: **3 seconds** (`RateLimitConstants.DeliveryDeferralDurationToStopHotLooping`). Reduces hot-loop frequency vs 1s; does **not** solve sustained overload or queue depth growth ([ADR 005](005-in-memory-queues-and-backpressure.md)).
+Deferral duration when delivery is rate-limited: **3 seconds** (`RateLimitConstants.DeliveryDeferralDurationToStopHotLooping`). Reduces hot-loop frequency vs 3s; does **not** solve sustained overload or queue depth growth ([ADR 005](005-in-memory-queues-and-backpressure.md)).
 
 ### Tripwire for future changes
 
@@ -27,12 +27,14 @@ Deferral duration when delivery is rate-limited: **3 seconds** (`RateLimitConsta
 
 1. Ingest fills window → 429 on new events.
 2. Already-accepted events fan out to dispatch queue.
-3. Delivery hits same window → defer 3s, repeat.
+3. Delivery hits same window → defer 3s, repeat [this can happen indefinitely - see Production alternative for solution]
 4. Dispatch queue depth grows until window slides or load drops.
 
 ## Production alternative (not implemented)
 
 Split limiters: **ingest budget** (events/min) vs **outbound budget** (sends/min, sized for fan-out). Or APIM at ingest + worker limit at delivery.
+
+**Deferral retry limit:** Currently a rate-limited dispatch defers indefinitely — `DeliveryAttempts` is never incremented on deferral, so the dead-letter threshold is never reached. Under sustained overload a dispatch item loops in the 3s cycle forever. A production system would want a separate deferral counter (distinct from delivery attempts) with a cap, after which the item is dead-lettered with a `RateLimitDeferralExceeded` reason rather than cycling forever.
 
 ## Consequences
 

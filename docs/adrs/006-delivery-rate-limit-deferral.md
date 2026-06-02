@@ -31,4 +31,4 @@ Without deferral, abandon immediately re-enqueues and the worker hot-loops on th
 ## Consequences
 
 - **Pros:** Clear semantics; delivery retries reserved for real send failures.
-- **Cons:** 1s delay is arbitrary; in-memory timer is not true lock expiry.
+- **Cons:** 3s delay is arbitrary; in-memory timer is not true lock expiry.
