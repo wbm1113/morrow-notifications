@@ -21,8 +21,12 @@ public class IngestionService(
         var tenant = await tenantRepository.GetByIdAsync(request.TenantId, ct)
             ?? throw new KeyNotFoundException($"Tenant '{request.TenantId}' not found.");
 
-        if (!tenant.IsActive)
-            throw new InvalidOperationException($"Tenant '{request.TenantId}' is inactive.");
+        // TODO: this check is currently unreachable — when a tenant is deactivated, TenantsController
+        // calls RemoveTenant(), so TryAcquire() returns TenantNotFound (404) before we get here.
+        // Tenant deactivation needs to be refactored to preserve the limiter entry with an "inactive"
+        // state so that TryAcquire() can return a distinct result and this path can return a 422.
+        // if (!tenant.IsActive)
+        //     throw new InvalidOperationException($"Tenant '{request.TenantId}' is inactive.");
 
         var message = new ProcessingMessage(
             Id: Guid.NewGuid(),

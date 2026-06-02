@@ -59,7 +59,9 @@ public class InMemoryMessageQueue<TMessage> : IMessageQueue<TMessage> where TMes
 
         if (visibilityDelay <= TimeSpan.Zero)
         {
-            await _channel.Writer.WriteAsync(message, ct);
+            // CancellationToken.None is intentional: the caller's token may already be cancelled
+            // (e.g. host shutdown), but we must still return the message to the queue to avoid loss.
+            await _channel.Writer.WriteAsync(message, CancellationToken.None);
             return;
         }
 

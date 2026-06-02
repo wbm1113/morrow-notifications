@@ -13,6 +13,10 @@ public class DispatchOutboxRepository(AppDbContext db) : IDispatchOutboxReposito
         if (max <= 0)
             return [];
 
+        // TODO: clock drift — in a multi-server deployment, using the application server's local
+        // clock here is unsafe. A server whose clock is ahead can steal a lease that hasn't actually
+        // expired yet. The fix is to compute `now` on the database server (e.g. via raw SQL using
+        // GETUTCDATE() / strftime('now') so all comparisons use a single authoritative time source.
         var now = DateTime.UtcNow;
         var leaseUntil = now.Add(OutboxClaimConstants.ClaimLeaseDuration);
 
