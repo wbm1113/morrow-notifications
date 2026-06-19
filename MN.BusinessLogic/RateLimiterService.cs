@@ -2,6 +2,17 @@ using System.Threading.RateLimiting;
 using MN.Core;
 using MN.Interfaces;
 
+/*
+If you used a ConcurrentDictionary, there is no way to safely guarantee that another
+ thread isn't right in the middle of executing TryAcquire on that exact limiter at the 
+ exact millisecond you call Dispose() on it. By using ReaderWriterLockSlim, you wrap the 
+ entire operation—checking the dictionary, disposing the old limiter, and inserting the 
+ new one—in a single, atomic, thread-safe block.  
+
+ ahh - signatures would have to change to task-based to move to async redis. probably
+ should have done that up front.
+*/
+
 namespace MN.BusinessLogic;
 
 public class RateLimiterService : IRateLimiterService, IDisposable

@@ -1,0 +1,4578 @@
+﻿// ============================================================
+// MN.BusinessLogic\DeliveryProcessorService.cs
+// ============================================================
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using MN.Core;
+using MN.Interfaces;
+using MN.Models;
+
+namespace MN.BusinessLogic;
+
+public class DeliveryProcessorService(
+    IDispatchQueue dispatchQueue,
+    IDeadLetterQueue deadLetterQueue,
+    IMessageDispatcher dispatcher,
+    IRateLimiterService rateLimiterService,
+    IServiceScopeFactory scopeFactory,
+    ILogger<DeliveryProcessorService> logger) : BackgroundService
+{
+    private const int BatchSize = 50;
+    private const int MaxDeliveryAttempts = 3;
+    private static readonly TimeSpan TimeToWaitInBetweenCheckingQueue = TimeSpan.FromMilliseconds(100);
+    // Stand-in for ASB ScheduledEnqueueTimeUtc â€” hold the message off-queue so rate-limited
+    // abandons do not hot-loop. Does not consume delivery attempts.
+    private static readonly TimeSpan RateLimitDeferralDurationToStopHotLooping =
+        RateLimitConstants.DeliveryDeferralDurationToStopHotLooping;
+
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        logger.LogInformation("Delivery processor started.");
+
+        while (!ct.IsCancellationRequested)
+        {
+            // Dispatch queue items enqueued by DispatchOutboxPublisherService.
+            var batch = await dispatchQueue.PeekLockBatchAsync(BatchSize, TimeToWaitInBetweenCheckingQueue, ct);
+            if (batch.Count == 0) continue;
+
+            logger.LogDebug(
+                "Peek-locked {Count} dispatch item(s) across {TenantCount} tenant(s).",
+                batch.Count,
+                batch.Select(l => l.Message.TenantId).Distinct().Count());
+
+            var tenantGroups = batch.GroupBy(l => l.Message.TenantId);
+            foreach (var group in tenantGroups)
+                await ProcessTenantGroupAsync(group, ct);
+        }
+
+        logger.LogInformation("Delivery processor stopped.");
+    }
+
+    private async Task ProcessTenantGroupAsync(
+        IGrouping<Guid, PeekLock<DispatchMessage>> group, CancellationToken ct)
+    {
+        using var scope = scopeFactory.CreateScope();
+        var dispatchRepo = scope.ServiceProvider.GetRequiredService<IDispatchRepository>();
+        var messageRepo = scope.ServiceProvider.GetRequiredService<IMessageRepository>();
+        var ruleRepo = scope.ServiceProvider.GetRequiredService<IRoutingRuleRepository>();
+        var tenantContext = scope.ServiceProvider.GetRequiredService<ITenantContext>();
+        tenantContext.CurrentTenantId = group.Key;
+
+        foreach (var peekLock in group)
+            await ProcessDispatchAsync(peekLock, dispatchRepo, messageRepo, ruleRepo, ct);
+    }
+
+    private async Task ProcessDispatchAsync(
+        PeekLock<DispatchMessage> peekLock,
+        IDispatchRepository dispatchRepo,
+        IMessageRepository messageRepo,
+        IRoutingRuleRepository ruleRepo,
+        CancellationToken ct)
+    {
+        var (lockToken, dispatch) = peekLock;
+
+        var acquireResult = rateLimiterService.TryAcquire(dispatch.TenantId);
+        if (acquireResult == AcquireResult.RateLimitExceeded)
+        {
+            logger.LogDebug(
+                "Dispatch {DispatchId} rate-limited for tenant {TenantId}. Requeueing after {Delay}.",
+                dispatch.Id, dispatch.TenantId, RateLimitDeferralDurationToStopHotLooping);
+            await dispatchQueue.AbandonAsync(lockToken, ct, RateLimitDeferralDurationToStopHotLooping);
+            return;
+        }
+
+        dispatch.DeliveryAttempts++;
+
+        try
+        {
+            var existing = await dispatchRepo.GetByIdAsync(dispatch.TenantId, dispatch.Id, ct);
+            // Publisher enqueues then sets PublishedAt â€” not atomic with the broker. Crash in between
+            // leaves the row unpublished, so republish puts the same dispatch on the queue again.
+            // Skip send if this dispatch already succeeded.
+            if (existing?.Status == DispatchStatus.Succeeded)
+            {
+                await dispatchQueue.CompleteAsync(lockToken, ct);
+                return;
+            }
+
+            var rule = await ruleRepo.GetByIdAsync(dispatch.TenantId, dispatch.RuleId, ct);
+            if (rule is null || !rule.IsActive)
+            {
+                await DeadLetterDispatchAsync(
+                    lockToken, dispatch,
+                    $"Routing rule '{dispatch.RuleId}' not found or inactive.",
+                    dispatchRepo, messageRepo, ct);
+                return;
+            }
+
+            // -> MessageDispatcher
+            await dispatcher.DispatchAsync(dispatch, rule, ct);
+
+            // At-least-once gap: crash after send but before Succeeded â†’ redelivery still sees Pending
+            // and may send again. Tolerated on purpose â€” prefer a rare duplicate over losing the send.
+            await dispatchRepo.UpdateStatusAsync(
+                dispatch.TenantId, dispatch.Id, DispatchStatus.Succeeded, ct);
+            await dispatchQueue.CompleteAsync(lockToken, ct);
+            await UpdateParentMessageStatusAsync(dispatch, dispatchRepo, messageRepo, ct);
+
+            logger.LogInformation(
+                "Dispatch {DispatchId} delivered for event {MessageId} via {ChannelType}.",
+                dispatch.Id, dispatch.OriginalMessageId, dispatch.ChannelType);
+        }
+        catch (Exception ex)
+        {
+            if (dispatch.DeliveryAttempts >= MaxDeliveryAttempts)
+            {
+                logger.LogError(ex,
+                    "Dispatch {DispatchId} exceeded {Max} delivery attempts. Dead-lettering.",
+                    dispatch.Id, MaxDeliveryAttempts);
+                await DeadLetterDispatchAsync(
+                    lockToken, dispatch,
+                    $"Max delivery attempts exceeded: {ex.Message}",
+                    dispatchRepo, messageRepo, ct);
+            }
+            else
+            {
+                logger.LogWarning(ex,
+                    "Dispatch {DispatchId} attempt {Attempt}/{Max} failed. Abandoning for retry.",
+                    dispatch.Id, dispatch.DeliveryAttempts, MaxDeliveryAttempts);
+                await dispatchQueue.AbandonAsync(lockToken, ct);
+            }
+        }
+    }
+
+    private async Task DeadLetterDispatchAsync(
+        Guid lockToken,
+        DispatchMessage dispatch,
+        string reason,
+        IDispatchRepository dispatchRepo,
+        IMessageRepository messageRepo,
+        CancellationToken ct)
+    {
+        await deadLetterQueue.SendAsync(new DeadLetterMessage
+        {
+            Id = Guid.NewGuid(),
+            TenantId = dispatch.TenantId,
+            OriginalMessageId = dispatch.OriginalMessageId,
+            DispatchId = dispatch.Id,
+            ChannelType = dispatch.ChannelType,
+            SchemaVersion = dispatch.SchemaVersion,
+            EventType = dispatch.EventType,
+            Payload = dispatch.Payload,
+            FailureReason = reason,
+            FailedAt = DateTime.UtcNow
+        }, ct);
+
+        await dispatchRepo.UpdateStatusAsync(
+            dispatch.TenantId, dispatch.Id, DispatchStatus.Failed, ct);
+        await dispatchQueue.CompleteAsync(lockToken, ct);
+        await UpdateParentMessageStatusAsync(dispatch, dispatchRepo, messageRepo, ct);
+
+        logger.LogWarning(
+            "Dispatch {DispatchId} for event {MessageId} dead-lettered: {Reason}",
+            dispatch.Id, dispatch.OriginalMessageId, reason);
+    }
+
+    private static async Task UpdateParentMessageStatusAsync(
+        DispatchMessage dispatch,
+        IDispatchRepository dispatchRepo,
+        IMessageRepository messageRepo,
+        CancellationToken ct)
+    {
+        var dispatches = await dispatchRepo.GetByOriginalMessageAsync(
+            dispatch.TenantId, dispatch.OriginalMessageId, ct);
+
+        if (dispatches.Any(d => d.Status == DispatchStatus.Pending))
+            return;
+
+        var succeeded = dispatches.Count(d => d.Status == DispatchStatus.Succeeded);
+        var failed = dispatches.Count(d => d.Status == DispatchStatus.Failed);
+
+        var status = failed == 0
+            ? MessageStatus.Dispatched
+            : succeeded > 0
+                ? MessageStatus.PartiallyDispatched
+                : MessageStatus.DeliveryFailed;
+
+        string? failureReason = failed > 0
+            ? $"{failed} of {dispatches.Count} channel dispatch(es) failed."
+            : null;
+
+        await messageRepo.UpdateStatusAsync(
+            dispatch.TenantId, dispatch.OriginalMessageId, status, failureReason, ct);
+    }
+}
+
+// ============================================================
+// MN.BusinessLogic\DispatchOutboxPublisherService.cs
+// ============================================================
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using MN.Entities;
+using MN.Interfaces;
+using MN.Models;
+
+namespace MN.BusinessLogic;
+
+public class DispatchOutboxPublisherService(
+    IDispatchQueue dispatchQueue,
+    IServiceScopeFactory scopeFactory,
+    ILogger<DispatchOutboxPublisherService> logger) : BackgroundService
+{
+    private const int BatchSize = 50;
+    private static readonly TimeSpan IdleDelay = TimeSpan.FromMilliseconds(100);
+    private readonly string _instanceId = Guid.NewGuid().ToString("N");
+
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        logger.LogInformation("Dispatch outbox publisher started.");
+
+        while (!ct.IsCancellationRequested)
+        {
+            using var scope = scopeFactory.CreateScope();
+            var outboxRepo = scope.ServiceProvider.GetRequiredService<IDispatchOutboxRepository>();
+            // Claim unpublished rows (lease prevents other publisher instances taking the same row).
+            var batch = await outboxRepo.TryClaimUnpublishedAcrossTenantsAsync(BatchSize, _instanceId, ct);
+
+            if (batch.Count == 0)
+            {
+                await Task.Delay(IdleDelay, ct);
+                continue;
+            }
+
+            logger.LogDebug(
+                "Fetched {Count} unpublished outbox entr(y/ies) across {TenantCount} tenant(s).",
+                batch.Count,
+                batch.Select(e => e.TenantId).Distinct().Count());
+
+            var tenantGroups = batch.GroupBy(e => e.TenantId);
+            foreach (var group in tenantGroups)
+                await ProcessTenantGroupAsync(group, ct);
+        }
+
+        logger.LogInformation("Dispatch outbox publisher stopped.");
+    }
+
+    private async Task ProcessTenantGroupAsync(
+        IGrouping<Guid, DispatchOutboxEntry> group, CancellationToken ct)
+    {
+        using var scope = scopeFactory.CreateScope();
+        var tenantContext = scope.ServiceProvider.GetRequiredService<ITenantContext>();
+        tenantContext.CurrentTenantId = group.Key;
+
+        var outboxRepo = scope.ServiceProvider.GetRequiredService<IDispatchOutboxRepository>();
+
+        // -> DeliveryProcessorService (dispatch queue)
+        foreach (var entry in group)
+            await dispatchQueue.EnqueueAsync(ToDispatchMessage(entry), ct);
+
+        // Mark published only after the whole tenant group is enqueued. Not atomic with the
+        // broker â€” crash after enqueue but before this â†’ republish â†’ duplicate queue messages.
+        await outboxRepo.MarkPublishedAsync(group.Select(e => e.Id).ToList(), _instanceId, ct);
+
+        logger.LogDebug(
+            "Published {Count} dispatch outbox entr(y/ies) for tenant {TenantId}.",
+            group.Count(), group.Key);
+    }
+
+    private static DispatchMessage ToDispatchMessage(DispatchOutboxEntry entry) =>
+        new(
+            Id: entry.Id,
+            OriginalMessageId: entry.OriginalMessageId,
+            TenantId: entry.TenantId,
+            RuleId: entry.RuleId,
+            ChannelType: entry.ChannelType,
+            SchemaVersion: entry.SchemaVersion,
+            EventType: entry.EventType,
+            Payload: entry.Payload,
+            CreatedAt: entry.MessageCreatedAt);
+}
+
+// ============================================================
+// MN.BusinessLogic\EventRoutingProcessorService.cs
+// ============================================================
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using MN.Core;
+using MN.Entities;
+using MN.Interfaces;
+using MN.Models;
+
+namespace MN.BusinessLogic;
+
+public class EventRoutingProcessorService(
+    IEventQueue eventQueue,
+    IDeadLetterQueue deadLetterQueue,
+    IServiceScopeFactory scopeFactory,
+    ILogger<EventRoutingProcessorService> logger) : BackgroundService
+{
+    private const int BatchSize = 50;
+    private const int MaxDeliveryAttempts = 3;
+    private static readonly TimeSpan TimeToWaitInBetweenCheckingQueue = TimeSpan.FromMilliseconds(100);
+
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        logger.LogInformation("Event routing processor started.");
+
+        while (!ct.IsCancellationRequested)
+        {
+            // Event queue â€” enqueued by IngestionService.
+            var batch = await eventQueue.PeekLockBatchAsync(BatchSize, TimeToWaitInBetweenCheckingQueue, ct);
+            if (batch.Count == 0) continue;
+
+            logger.LogDebug(
+                "Peek-locked {Count} event(s) across {TenantCount} tenant(s).",
+                batch.Count,
+                batch.Select(l => l.Message.TenantId).Distinct().Count());
+
+            var tenantGroups = batch.GroupBy(l => l.Message.TenantId);
+            foreach (var group in tenantGroups)
+                await ProcessTenantGroupAsync(group, ct);
+        }
+
+        logger.LogInformation("Event routing processor stopped.");
+    }
+
+    private async Task ProcessTenantGroupAsync(
+        IGrouping<Guid, PeekLock<ProcessingMessage>> group, CancellationToken ct)
+    {
+        using var scope = scopeFactory.CreateScope();
+        var messageRepo = scope.ServiceProvider.GetRequiredService<IMessageRepository>();
+        var dispatchRepo = scope.ServiceProvider.GetRequiredService<IDispatchRepository>();
+        var ruleRepo = scope.ServiceProvider.GetRequiredService<IRoutingRuleRepository>();
+        var tenantRepo = scope.ServiceProvider.GetRequiredService<ITenantRepository>();
+        var tenantContext = scope.ServiceProvider.GetRequiredService<ITenantContext>();
+        tenantContext.CurrentTenantId = group.Key;
+
+        foreach (var peekLock in group)
+            await ProcessEventAsync(peekLock, messageRepo, dispatchRepo, ruleRepo, tenantRepo, ct);
+    }
+
+    private async Task ProcessEventAsync(
+        PeekLock<ProcessingMessage> peekLock,
+        IMessageRepository messageRepo,
+        IDispatchRepository dispatchRepo,
+        IRoutingRuleRepository ruleRepo,
+        ITenantRepository tenantRepo,
+        CancellationToken ct)
+    {
+        var (lockToken, message) = peekLock;
+        message.DeliveryAttempts++;
+
+        await messageRepo.EnsureProcessingAsync(new NotificationMessage
+        {
+            Id = message.Id,
+            TenantId = message.TenantId,
+            SchemaVersion = message.SchemaVersion,
+            EventType = message.EventType,
+            Payload = message.Payload,
+            Status = MessageStatus.Processing,
+            CreatedAt = message.CreatedAt
+        }, ct);
+
+        try
+        {
+            var tenant = await tenantRepo.GetByIdAsync(message.TenantId, ct);
+            if (tenant is null || !tenant.IsActive)
+            {
+                await DeadLetterEventAsync(lockToken, message, "Tenant not found or inactive.", messageRepo, ct);
+                return;
+            }
+
+            // DAL owns the logic of rule matching which isn't ideal.  probably would want to pull
+            // the rules out and pass those to a service that figures out which rules match.
+            var rules = await ruleRepo.GetMatchingRulesAsync(message.TenantId, message.EventType, ct);
+            if (rules.Count == 0)
+            {
+                await DeadLetterEventAsync(
+                    lockToken, message,
+                    $"No matching routing rules for event type '{message.EventType}'.",
+                    messageRepo, ct);
+                return;
+            }
+
+            // Transactional outbox: dispatch + outbox rows in one commit. No direct dispatch-queue
+            // enqueue here â€” avoids orphan Pending rows if we crash before publish.
+            var scheduled = await dispatchRepo.PrepareDispatchesForRoutingAsync(message, rules, ct);
+
+            // -> DispatchOutboxPublisherService (outbox table)
+
+            await messageRepo.UpdateStatusAsync(
+                message.TenantId, message.Id, MessageStatus.FanOutComplete, null, ct);
+            await eventQueue.CompleteAsync(lockToken, ct);
+
+            logger.LogInformation(
+                "Event {MessageId} routed for tenant {TenantId}: {Scheduled}/{RuleCount} dispatch(es) scheduled via outbox.",
+                message.Id, message.TenantId, scheduled, rules.Count);
+        }
+        catch (Exception ex)
+        {
+            if (message.DeliveryAttempts >= MaxDeliveryAttempts)
+            {
+                logger.LogError(ex,
+                    "Event {MessageId} exceeded {Max} routing attempts. Dead-lettering.",
+                    message.Id, MaxDeliveryAttempts);
+                await DeadLetterEventAsync(
+                    lockToken, message,
+                    $"Max routing attempts exceeded: {ex.Message}",
+                    messageRepo, ct);
+            }
+            else
+            {
+                logger.LogWarning(ex,
+                    "Event {MessageId} routing attempt {Attempt}/{Max} failed. Abandoning for retry.",
+                    message.Id, message.DeliveryAttempts, MaxDeliveryAttempts);
+                await eventQueue.AbandonAsync(lockToken, ct);
+            }
+        }
+    }
+
+    private async Task DeadLetterEventAsync(
+        Guid lockToken,
+        ProcessingMessage message,
+        string reason,
+        IMessageRepository messageRepo,
+        CancellationToken ct)
+    {
+        await deadLetterQueue.SendAsync(new DeadLetterMessage
+        {
+            Id = Guid.NewGuid(),
+            TenantId = message.TenantId,
+            OriginalMessageId = message.Id,
+            SchemaVersion = message.SchemaVersion,
+            EventType = message.EventType,
+            Payload = message.Payload,
+            FailureReason = reason,
+            FailedAt = DateTime.UtcNow
+        }, ct);
+
+        await messageRepo.UpdateStatusAsync(
+            message.TenantId, message.Id, MessageStatus.DeadLettered, reason, ct);
+        await eventQueue.CompleteAsync(lockToken, ct);
+
+        logger.LogWarning(
+            "Event {MessageId} for tenant {TenantId} dead-lettered during routing: {Reason}",
+            message.Id, message.TenantId, reason);
+    }
+}
+
+// ============================================================
+// MN.BusinessLogic\IngestionService.cs
+// ============================================================
+using MN.Core;
+using MN.Interfaces;
+using MN.Models;
+using static MN.Core.MessageSchemaVersion;
+
+namespace MN.BusinessLogic;
+
+public class IngestionService(
+    ITenantRepository tenantRepository,
+    IEventQueue eventQueue,
+    IRateLimiterService rateLimiterService) : IIngestionService
+{
+    public async Task<IngestEventResponse> IngestAsync(IngestEventRequest request, CancellationToken ct)
+    {
+        var acquireResult = rateLimiterService.TryAcquire(request.TenantId);
+        if (acquireResult == AcquireResult.TenantNotFound)
+            throw new KeyNotFoundException($"Tenant '{request.TenantId}' not found.");
+        if (acquireResult == AcquireResult.RateLimitExceeded)
+            throw new RateLimitExceededException($"Rate limit exceeded for tenant '{request.TenantId}'.");
+
+        var tenant = await tenantRepository.GetByIdAsync(request.TenantId, ct)
+            ?? throw new KeyNotFoundException($"Tenant '{request.TenantId}' not found.");
+
+        // TODO: this check is currently unreachable â€” when a tenant is deactivated, TenantsController
+        // calls RemoveTenant(), so TryAcquire() returns TenantNotFound (404) before we get here.
+        // Tenant deactivation needs to be refactored to preserve the limiter entry with an "inactive"
+        // state so that TryAcquire() can return a distinct result and this path can return a 422.
+        // if (!tenant.IsActive)
+        //     throw new InvalidOperationException($"Tenant '{request.TenantId}' is inactive.");
+
+        var message = new ProcessingMessage(
+            Id: Guid.NewGuid(),
+            TenantId: request.TenantId,
+            SchemaVersion: Current,
+            EventType: request.EventType,
+            Payload: request.Payload,
+            CreatedAt: DateTime.UtcNow);
+
+        // -> EventRoutingProcessorService (event queue)
+        await eventQueue.EnqueueAsync(message, ct);
+
+        return new IngestEventResponse(message.Id);
+    }
+}
+
+// ============================================================
+// MN.BusinessLogic\MessageDispatcher.cs
+// ============================================================
+using Microsoft.Extensions.Logging;
+using MN.Entities;
+using MN.Interfaces;
+using MN.Models;
+
+namespace MN.BusinessLogic;
+
+public class MessageDispatcher(
+    IEnumerable<INotificationChannel> channels,
+    ILogger<MessageDispatcher> logger) : IMessageDispatcher
+{
+    private const int MaxChannelAttempts = 2;
+    private static readonly TimeSpan ChannelTimeout = TimeSpan.FromSeconds(3);
+
+    private readonly IReadOnlyDictionary<string, INotificationChannel> _channels =
+        channels.ToDictionary(c => c.ChannelType, StringComparer.OrdinalIgnoreCase);
+
+    public async Task DispatchAsync(DispatchMessage dispatch, RoutingRule rule, CancellationToken ct)
+    {
+        if (!_channels.TryGetValue(rule.ChannelType, out var channel))
+            throw new InvalidOperationException(
+                $"No channel implementation registered for type '{rule.ChannelType}'.");
+
+        for (var attempt = 1; attempt <= MaxChannelAttempts; attempt++)
+        {
+            try
+            {
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeoutCts.CancelAfter(ChannelTimeout);
+                // -> INotificationChannel (Slack / Teams)
+                await channel.SendAsync(dispatch, rule, timeoutCts.Token);
+                return;
+            }
+            catch (Exception ex) when (attempt < MaxChannelAttempts)
+            {
+                logger.LogWarning(
+                    ex,
+                    "Channel {ChannelType} attempt {Attempt}/{Max} failed for dispatch {DispatchId}. Retrying.",
+                    rule.ChannelType, attempt, MaxChannelAttempts, dispatch.Id);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(
+                    ex,
+                    "Channel {ChannelType} attempt {Attempt}/{Max} failed for dispatch {DispatchId}. No retries left.",
+                    rule.ChannelType, attempt, MaxChannelAttempts, dispatch.Id);
+                throw;
+            }
+        }
+    }
+}
+
+// ============================================================
+// MN.BusinessLogic\RateLimiterService.cs
+// ============================================================
+using System.Threading.RateLimiting;
+using MN.Core;
+using MN.Interfaces;
+
+/*
+If you used a ConcurrentDictionary, there is no way to safely guarantee that another
+ thread isn't right in the middle of executing TryAcquire on that exact limiter at the 
+ exact millisecond you call Dispose() on it. By using ReaderWriterLockSlim, you wrap the 
+ entire operationâ€”checking the dictionary, disposing the old limiter, and inserting the 
+ new oneâ€”in a single, atomic, thread-safe block.  
+
+ ahh - signatures would have to change to task-based to move to async redis. probably
+ should have done that up front.
+*/
+
+namespace MN.BusinessLogic;
+
+public class RateLimiterService : IRateLimiterService, IDisposable
+{
+    private readonly Dictionary<Guid, (SlidingWindowRateLimiter Limiter, int RequestsPerMinute)> _limiters = new();
+    private readonly ReaderWriterLockSlim _rwLock = new(LockRecursionPolicy.NoRecursion);
+
+    public AcquireResult TryAcquire(Guid tenantId)
+    {
+        _rwLock.EnterReadLock();
+        try
+        {
+            if (!_limiters.TryGetValue(tenantId, out var entry))
+                return AcquireResult.TenantNotFound;
+
+            using var lease = entry.Limiter.AttemptAcquire();
+            return lease.IsAcquired ? AcquireResult.Acquired : AcquireResult.RateLimitExceeded;
+        }
+        finally
+        {
+            _rwLock.ExitReadLock();
+        }
+    }
+
+    public void ConfigureTenant(Guid tenantId, int requestsPerMinute)
+    {
+        _rwLock.EnterWriteLock();
+        try
+        {
+            if (_limiters.TryGetValue(tenantId, out var existing))
+            {
+                if (existing.RequestsPerMinute == requestsPerMinute) return;
+                existing.Limiter.Dispose();
+                _limiters.Remove(tenantId);
+            }
+
+            var limiter = new SlidingWindowRateLimiter(new SlidingWindowRateLimiterOptions
+            {
+                PermitLimit = requestsPerMinute,
+                Window = TimeSpan.FromMinutes(1),
+                SegmentsPerWindow = 6,
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                QueueLimit = 0
+            });
+
+            _limiters[tenantId] = (limiter, requestsPerMinute);
+        }
+        finally
+        {
+            _rwLock.ExitWriteLock();
+        }
+    }
+
+    public void RemoveTenant(Guid tenantId)
+    {
+        _rwLock.EnterWriteLock();
+        try
+        {
+            if (_limiters.Remove(tenantId, out var entry))
+                entry.Limiter.Dispose();
+        }
+        finally
+        {
+            _rwLock.ExitWriteLock();
+        }
+    }
+
+    public void Dispose()
+    {
+        _rwLock.EnterWriteLock();
+        try
+        {
+            foreach (var entry in _limiters.Values)
+                entry.Limiter.Dispose();
+            _limiters.Clear();
+        }
+        finally
+        {
+            _rwLock.ExitWriteLock();
+            _rwLock.Dispose();
+        }
+    }
+}
+
+// ============================================================
+// MN.BusinessLogic\RateLimitExceededException.cs
+// ============================================================
+namespace MN.BusinessLogic;
+
+public sealed class RateLimitExceededException(string message) : Exception(message);
+
+// ============================================================
+// MN.BusinessLogic\SlackChannel.cs
+// ============================================================
+using Microsoft.Extensions.Logging;
+using MN.Core;
+using MN.Entities;
+using MN.Interfaces;
+using MN.Models;
+
+namespace MN.BusinessLogic;
+
+/// <summary>
+/// Stub Slack channel. Replace the body of SendAsync with the Slack Web API call
+/// (POST to https://slack.com/api/chat.postMessage) when a real token is available.
+/// </summary>
+public class SlackChannel(ILogger<SlackChannel> logger) : INotificationChannel
+{
+    public string ChannelType => ChannelTypes.Slack;
+
+    public Task SendAsync(DispatchMessage dispatch, RoutingRule rule, CancellationToken ct)
+    {
+        logger.LogInformation(
+            "[SLACK CHANNEL - STUB] TenantId={TenantId} DispatchId={DispatchId} EventType={EventType}",
+            dispatch.TenantId, dispatch.Id, dispatch.EventType);
+
+        return Task.CompletedTask;
+    }
+}
+
+// ============================================================
+// MN.BusinessLogic\TeamsChannel.cs
+// ============================================================
+using Microsoft.Extensions.Logging;
+using MN.Core;
+using MN.Entities;
+using MN.Interfaces;
+using MN.Models;
+
+namespace MN.BusinessLogic;
+
+/// <summary>
+/// Stub Teams channel. Replace the body of SendAsync with an Adaptive Card POST
+/// to the tenant's incoming webhook URL when ready.
+/// </summary>
+public class TeamsChannel(ILogger<TeamsChannel> logger) : INotificationChannel
+{
+    public string ChannelType => ChannelTypes.Teams;
+
+    public Task SendAsync(DispatchMessage dispatch, RoutingRule rule, CancellationToken ct)
+    {
+        logger.LogInformation(
+            "[TEAMS CHANNEL - STUB] TenantId={TenantId} DispatchId={DispatchId} EventType={EventType}",
+            dispatch.TenantId, dispatch.Id, dispatch.EventType);
+
+        return Task.CompletedTask;
+    }
+}
+
+// ============================================================
+// MN.Core\AcquireResult.cs
+// ============================================================
+namespace MN.Core;
+
+public enum AcquireResult
+{
+    Acquired,
+    TenantNotFound,
+    RateLimitExceeded
+}
+
+// ============================================================
+// MN.Core\ChannelTypes.cs
+// ============================================================
+namespace MN.Core;
+
+public static class ChannelTypes
+{
+    public const string Slack = "slack";
+    public const string Teams = "teams";
+}
+
+// ============================================================
+// MN.Core\DispatchStatus.cs
+// ============================================================
+namespace MN.Core;
+
+public enum DispatchStatus
+{
+    Pending,
+    Succeeded,
+    Failed
+}
+
+// ============================================================
+// MN.Core\MessageSchemaVersion.cs
+// ============================================================
+namespace MN.Core;
+
+public static class MessageSchemaVersion
+{
+    /// <summary>
+    /// Current internal message schema version. Bump this when the NotificationMessage
+    /// structure changes in a breaking way so old records can be identified and migrated.
+    /// </summary>
+    public const int Current = 1;
+}
+
+// ============================================================
+// MN.Core\MessageStatus.cs
+// ============================================================
+namespace MN.Core;
+
+public enum MessageStatus
+{
+    Processing,
+    FanOutComplete,
+    Dispatched,
+    PartiallyDispatched,
+    DeliveryFailed,
+    DeadLettered
+}
+
+// ============================================================
+// MN.Core\NotificationLimits.cs
+// ============================================================
+namespace MN.Core;
+
+public static class NotificationLimits
+{
+    /// <summary>
+    /// Maximum JSON payload size accepted at ingest and stored on message/outbox rows.
+    /// Large enough for rich notification context; not a blob store.
+    /// </summary>
+    public const int MaxPayloadLength = 32_768;
+}
+
+// ============================================================
+// MN.Core\OutboxClaimConstants.cs
+// ============================================================
+namespace MN.Core;
+
+public static class OutboxClaimConstants
+{
+    /// <summary>
+    /// How long a publisher instance exclusively owns an outbox row after a successful claim.
+    /// Expired leases can be reclaimed by another instance (crash recovery).
+    /// </summary>
+    public static readonly TimeSpan ClaimLeaseDuration = TimeSpan.FromSeconds(30);
+}
+
+// ============================================================
+// MN.Core\RateLimitConstants.cs
+// ============================================================
+namespace MN.Core;
+
+/// <summary>
+/// Shared rate-limit knobs. Delivery fan-out is bounded by <see cref="ChannelTypes"/> count;
+/// each channel increases pressure on the shared per-tenant sliding window at delivery.
+/// Bump <see cref="MaxRateLimitSurfaceArea"/> when adding a channel â€” see
+/// docs/adrs/011-shared-ingest-and-delivery-rate-limiting.md and MN.Tests.RateLimitSurfaceAreaTests.
+/// </summary>
+public static class RateLimitConstants
+{
+    /// <summary>
+    /// Stand-in for ASB scheduled enqueue on delivery deferral â€” hold item off-queue to avoid hot-loop.
+    /// </summary>
+    public static readonly TimeSpan DeliveryDeferralDurationToStopHotLooping = TimeSpan.FromSeconds(3);
+
+    /// <summary>Weight per channel when estimating shared-limiter surface area.</summary>
+    public const int PermitsConsumedPerChannel = 1;
+
+    /// <summary>
+    /// Maximum allowed <c>ChannelTypes member count Ã— PermitsConsumedPerChannel</c>.
+    /// Increase deliberately when adding a new channel type.
+    /// </summary>
+    public const int MaxRateLimitSurfaceArea = 2;
+}
+
+// ============================================================
+// MN.DAL\AppDbContext.cs
+// ============================================================
+using Microsoft.EntityFrameworkCore;
+using MN.Core;
+using MN.Entities;
+using MN.Interfaces;
+
+namespace MN.DAL;
+
+public class AppDbContext(DbContextOptions<AppDbContext> options, ITenantContext tenantContext) : DbContext(options)
+{
+    public DbSet<Tenant> Tenants => Set<Tenant>();
+    public DbSet<RoutingRule> RoutingRules => Set<RoutingRule>();
+    public DbSet<NotificationMessage> Messages => Set<NotificationMessage>();
+    public DbSet<NotificationDispatch> Dispatches => Set<NotificationDispatch>();
+    public DbSet<DispatchOutboxEntry> DispatchOutbox => Set<DispatchOutboxEntry>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<Tenant>(e =>
+        {
+            e.HasKey(t => t.Id);
+
+            // maybe not necessary.  would help with devops notifications (e.g. 'Acme Corp' is down
+            // only means 1 thing).  also if you want to give tenants different URLs and use names
+            // as a slug.
+            e.HasIndex(t => t.Name).IsUnique();
+
+            e.Property(t => t.Name).IsRequired().HasMaxLength(200);
+        });
+
+        modelBuilder.Entity<RoutingRule>(e =>
+        {
+            e.HasKey(r => r.Id);
+
+            // One rule per channel per event type — bounded multi-channel fan-out per ingest.
+            // stops tenant from footgunning with duplicate routing rules per channel per event type
+            e.HasIndex(r => new { r.TenantId, r.EventType, r.ChannelType }).IsUnique();
+
+            e.Property(r => r.EventType).IsRequired().HasMaxLength(200);
+            e.Property(r => r.ChannelType).IsRequired().HasMaxLength(50);
+            e.HasOne(r => r.Tenant)
+             .WithMany(t => t.RoutingRules)
+             .HasForeignKey(r => r.TenantId)
+             .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<NotificationMessage>(e =>
+        {
+            e.HasKey(m => m.Id);
+
+            // quick status lookups.  "show me all my failed notifications" -> fast.
+            // might want to split this status out into two though, as the status is
+            // doing 2 jobs.  it shows the status of the notification and the status
+            // of the children at the same time, probably not good.
+            e.HasIndex(m => new { m.TenantId, m.Status });
+            
+            e.HasIndex(m => m.TenantId);
+            e.Property(m => m.EventType).IsRequired().HasMaxLength(200);
+            e.Property(m => m.Payload).IsRequired().HasMaxLength(NotificationLimits.MaxPayloadLength);
+        });
+
+        modelBuilder.Entity<NotificationDispatch>(e =>
+        {
+            e.HasKey(d => d.Id);
+            e.HasIndex(d => new { d.TenantId, d.OriginalMessageId });
+            e.Property(d => d.ChannelType).IsRequired().HasMaxLength(50);
+        });
+
+        modelBuilder.Entity<DispatchOutboxEntry>(e =>
+        {
+            e.HasKey(o => o.Id);
+            e.HasIndex(o => o.PublishedAt);
+            e.HasIndex(o => o.ClaimedUntil);
+            e.Property(o => o.ClaimedBy).HasMaxLength(64);
+            e.HasIndex(o => new { o.TenantId, o.OriginalMessageId });
+            e.Property(o => o.ChannelType).IsRequired().HasMaxLength(50);
+            e.Property(o => o.EventType).IsRequired().HasMaxLength(200);
+            e.Property(o => o.Payload).IsRequired().HasMaxLength(NotificationLimits.MaxPayloadLength);
+        });
+
+        // Global query filters: ORM-layer tenant isolation.
+        // Fail-closed by default: if neither CurrentTenantId nor IsAdminScope is set,
+        // queries on these tables return nothing. Admin paths that legitimately need
+        // cross-tenant reads must explicitly set tenantContext.IsAdminScope = true.
+        // Pair with TenantSessionContextInterceptor (sp_set_session_context) for engine-level
+        // defense-in-depth against Azure SQL Row-Level Security in production.
+        modelBuilder.Entity<RoutingRule>()
+            .HasQueryFilter(r => tenantContext.IsAdminScope
+                              || (tenantContext.CurrentTenantId.HasValue
+                                  && r.TenantId == tenantContext.CurrentTenantId.Value));
+
+        modelBuilder.Entity<NotificationMessage>()
+            .HasQueryFilter(m => tenantContext.IsAdminScope
+                              || (tenantContext.CurrentTenantId.HasValue
+                                  && m.TenantId == tenantContext.CurrentTenantId.Value));
+
+        modelBuilder.Entity<NotificationDispatch>()
+            .HasQueryFilter(d => tenantContext.IsAdminScope
+                              || (tenantContext.CurrentTenantId.HasValue
+                                  && d.TenantId == tenantContext.CurrentTenantId.Value));
+    }
+
+    // Mutation guard: global query filters protect reads only.
+    // Tenant-scoped writes require CurrentTenantId (stamp TenantId from context) or
+    // IsAdminScope (cross-tenant admin). Fail closed on missing context so a new code
+    // path cannot silently persist tenant-scoped data without isolation in place.
+    public override int SaveChanges()
+    {
+        ApplyTenantMutationGuard();
+        return base.SaveChanges();
+    }
+
+    public override Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)
+    {
+        ApplyTenantMutationGuard();
+        return base.SaveChangesAsync(cancellationToken);
+    }
+
+    private void ApplyTenantMutationGuard()
+    {
+        if (tenantContext.IsAdminScope)
+            return;
+
+        var tenantScopedMutations = ChangeTracker.Entries<ITenantScoped>()
+            .Where(e => e.State is EntityState.Added or EntityState.Modified)
+            .ToList();
+
+        if (tenantScopedMutations.Count == 0)
+            return;
+
+        if (!tenantContext.CurrentTenantId.HasValue)
+        {
+            throw new InvalidOperationException(
+                "Cannot save tenant-scoped entities without ITenantContext.CurrentTenantId set. " +
+                "Set CurrentTenantId before writing tenant-scoped data, or IsAdminScope for cross-tenant admin operations.");
+        }
+
+        foreach (var entry in tenantScopedMutations)
+            entry.Entity.TenantId = tenantContext.CurrentTenantId.Value;
+    }
+}
+
+// ============================================================
+// MN.DAL\DispatchOutboxRepository.cs
+// ============================================================
+using Microsoft.EntityFrameworkCore;
+using MN.Core;
+using MN.Entities;
+using MN.Interfaces;
+
+namespace MN.DAL;
+
+public class DispatchOutboxRepository(AppDbContext db) : IDispatchOutboxRepository
+{
+    public async Task<IReadOnlyList<DispatchOutboxEntry>> TryClaimUnpublishedAcrossTenantsAsync(
+        int max, string claimerId, CancellationToken ct)
+    {
+        if (max <= 0)
+            return [];
+
+        // TODO: clock drift â€” in a multi-server deployment, using the application server's local
+        // clock here is unsafe. A server whose clock is ahead can steal a lease that hasn't actually
+        // expired yet. The fix is to compute `now` on the database server (e.g. via raw SQL using
+        // GETUTCDATE() / strftime('now') so all comparisons use a single authoritative time source.
+        var now = DateTime.UtcNow;
+        var leaseUntil = now.Add(OutboxClaimConstants.ClaimLeaseDuration);
+
+        // Batch claim via ExecuteUpdate â€” EF translates to a single UPDATE â€¦ LIMIT on SQLite.
+        await db.DispatchOutbox
+            .Where(o => o.PublishedAt == null
+                        && (o.ClaimedUntil == null || o.ClaimedUntil < now))
+            .OrderBy(o => o.CreatedAt)
+            .Take(max)
+            .ExecuteUpdateAsync(
+                s => s
+                    .SetProperty(o => o.ClaimedUntil, leaseUntil)
+                    .SetProperty(o => o.ClaimedBy, claimerId),
+                ct);
+
+        // TODO: ExecuteUpdateAsync only returns a row count, so we need a second round-trip to
+        // read back the rows we just claimed. These two operations are not atomic â€” a race between
+        // two publisher instances is theoretically possible between them, though the WHERE filter
+        // on ClaimedBy + ClaimedUntil makes a false positive read unlikely in practice. The real
+        // fix is a single `UPDATE â€¦ RETURNING *` (SQLite 3.35+ / PostgreSQL) or `OUTPUT` (SQL
+        // Server) via FromSqlRaw, which stamps and returns the rows in one atomic round-trip.
+        // EF has no first-class API for this today.
+        return await db.DispatchOutbox
+            .Where(o => o.ClaimedBy == claimerId
+                        && o.PublishedAt == null
+                        && o.ClaimedUntil == leaseUntil)
+            .OrderBy(o => o.CreatedAt)
+            .ToListAsync(ct);
+    }
+    
+    public async Task MarkPublishedAsync(IReadOnlyList<Guid> ids, string claimerId, CancellationToken ct)
+    {
+        if (ids.Count == 0) return;
+
+        var now = DateTime.UtcNow;
+        var entries = await db.DispatchOutbox
+            .Where(o => ids.Contains(o.Id)
+                        && o.PublishedAt == null
+                        && o.ClaimedBy == claimerId)
+            .ToListAsync(ct);
+
+        foreach (var entry in entries)
+        {
+            entry.PublishedAt = now;
+            entry.ClaimedUntil = null;
+            entry.ClaimedBy = null;
+        }
+
+        if (entries.Count > 0)
+            await db.SaveChangesAsync(ct);
+    }
+}
+
+// ============================================================
+// MN.DAL\DispatchRepository.cs
+// ============================================================
+using Microsoft.EntityFrameworkCore;
+using MN.Core;
+using MN.Entities;
+using MN.Interfaces;
+using MN.Models;
+
+namespace MN.DAL;
+
+public class DispatchRepository(AppDbContext db) : IDispatchRepository
+{
+    public async Task<int> PrepareDispatchesForRoutingAsync(
+        ProcessingMessage message,
+        IReadOnlyList<RoutingRule> rules,
+        CancellationToken ct)
+    {
+        var existingDispatches = await db.Dispatches
+            .Where(d => d.TenantId == message.TenantId && d.OriginalMessageId == message.Id)
+            .ToDictionaryAsync(d => d.Id, ct);
+
+        var existingOutbox = await db.DispatchOutbox
+            .Where(o => o.TenantId == message.TenantId && o.OriginalMessageId == message.Id)
+            .ToDictionaryAsync(o => o.Id, ct);
+
+        var scheduled = 0;
+        var now = DateTime.UtcNow;
+
+        foreach (var rule in rules)
+        {
+            var dispatchId = DispatchMessage.CreateId(message.Id, rule.Id);
+            existingOutbox.TryGetValue(dispatchId, out var outbox);
+
+            if (existingDispatches.TryGetValue(dispatchId, out var dispatch))
+            {
+                switch (dispatch.Status)
+                {
+                    // Channel already delivered â€” no outbox touch; idempotent on event redelivery.
+                    case DispatchStatus.Succeeded:
+                        continue;
+
+                    case DispatchStatus.Pending:
+                        if (outbox is null)
+                        {
+                            // Orphan recovery: dispatch row exists but outbox insert never committed.
+                            AddOutboxEntry(message, rule, dispatchId, now);
+                            scheduled++;
+                        }
+                        else if (outbox.PublishedAt is null)
+                        {
+                            // Outbox exists, not yet published â€” publisher will pick it up; do not duplicate.
+                        }
+                        else
+                        {
+                            // Outbox published â€” item is on (or was on) the dispatch queue; delivery owns completion.
+                        }
+
+                        continue;
+
+                    case DispatchStatus.Failed:
+                        // Manual replay only: re-routing the same event (e.g. operational re-enqueue).
+                        // Normal delivery retries stay on the dispatch queue (DeliveryAttempts, max 3)
+                        // and end in Failed without touching this path. Reset to Pending and republish outbox.
+                        dispatch.Status = DispatchStatus.Pending;
+                        dispatch.ProcessedAt = null;
+                        scheduled += EnsureUnpublishedOutbox(message, rule, dispatchId, outbox, now);
+                        continue;
+                }
+
+                continue;
+            }
+
+            db.Dispatches.Add(new NotificationDispatch
+            {
+                Id = dispatchId,
+                TenantId = message.TenantId,
+                OriginalMessageId = message.Id,
+                RuleId = rule.Id,
+                ChannelType = rule.ChannelType,
+                Status = DispatchStatus.Pending,
+                CreatedAt = now
+            });
+
+            AddOutboxEntry(message, rule, dispatchId, now);
+            scheduled++;
+        }
+
+        if (db.ChangeTracker.HasChanges())
+            await db.SaveChangesAsync(ct);
+
+        return scheduled;
+    }
+
+    private int EnsureUnpublishedOutbox(
+        ProcessingMessage message,
+        RoutingRule rule,
+        Guid dispatchId,
+        DispatchOutboxEntry? outbox,
+        DateTime now)
+    {
+        if (outbox is null)
+        {
+            AddOutboxEntry(message, rule, dispatchId, now);
+            return 1;
+        }
+
+        if (outbox.PublishedAt is not null)
+        {
+            outbox.PublishedAt = null;
+            SyncOutboxPayload(outbox, message, rule);
+            return 1;
+        }
+
+        return 0;
+    }
+
+    private void AddOutboxEntry(ProcessingMessage message, RoutingRule rule, Guid dispatchId, DateTime now)
+    {
+        db.DispatchOutbox.Add(new DispatchOutboxEntry
+        {
+            Id = dispatchId,
+            TenantId = message.TenantId,
+            OriginalMessageId = message.Id,
+            RuleId = rule.Id,
+            ChannelType = rule.ChannelType,
+            SchemaVersion = message.SchemaVersion,
+            EventType = message.EventType,
+            Payload = message.Payload,
+            MessageCreatedAt = message.CreatedAt,
+            CreatedAt = now
+        });
+    }
+
+    private static void SyncOutboxPayload(DispatchOutboxEntry outbox, ProcessingMessage message, RoutingRule rule)
+    {
+        outbox.RuleId = rule.Id;
+        outbox.ChannelType = rule.ChannelType;
+        outbox.SchemaVersion = message.SchemaVersion;
+        outbox.EventType = message.EventType;
+        outbox.Payload = message.Payload;
+        outbox.MessageCreatedAt = message.CreatedAt;
+    }
+
+    public async Task<NotificationDispatch?> GetByIdAsync(Guid tenantId, Guid dispatchId, CancellationToken ct) =>
+        await db.Dispatches.FirstOrDefaultAsync(d => d.TenantId == tenantId && d.Id == dispatchId, ct);
+
+    public async Task UpdateStatusAsync(Guid tenantId, Guid dispatchId, DispatchStatus status, CancellationToken ct)
+    {
+        var dispatch = await db.Dispatches.FirstOrDefaultAsync(d => d.TenantId == tenantId && d.Id == dispatchId, ct);
+        if (dispatch is null) return;
+
+        dispatch.Status = status;
+        dispatch.ProcessedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync(ct);
+    }
+
+    public async Task<IReadOnlyList<NotificationDispatch>> GetByOriginalMessageAsync(
+        Guid tenantId, Guid originalMessageId, CancellationToken ct) =>
+        await db.Dispatches
+            .Where(d => d.TenantId == tenantId && d.OriginalMessageId == originalMessageId)
+            .ToListAsync(ct);
+}
+
+// ============================================================
+// MN.DAL\InMemoryDeadLetterQueue.cs
+// ============================================================
+using System.Collections.Concurrent;
+using MN.Models;
+using MN.Interfaces;
+
+namespace MN.DAL;
+
+// intentionally bare bones.  cloud queue provider should be handling this.
+
+public class InMemoryDeadLetterQueue : IDeadLetterQueue
+{
+    private readonly ConcurrentBag<DeadLetterMessage> _messages = new();
+
+    public ValueTask SendAsync(DeadLetterMessage message, CancellationToken ct)
+    {
+        _messages.Add(message);
+        return ValueTask.CompletedTask;
+    }
+
+    public IReadOnlyList<DeadLetterMessage> GetAll() =>
+        _messages.OrderByDescending(m => m.FailedAt).ToList();
+
+    public IReadOnlyList<DeadLetterMessage> GetByTenant(Guid tenantId) =>
+        _messages.Where(m => m.TenantId == tenantId)
+                 .OrderByDescending(m => m.FailedAt)
+                 .ToList();
+}
+
+// ============================================================
+// MN.DAL\InMemoryMessageQueue.cs
+// ============================================================
+using System.Collections.Concurrent;
+using System.Threading.Channels;
+using MN.Interfaces;
+
+namespace MN.DAL;
+
+public class InMemoryMessageQueue<TMessage> : IMessageQueue<TMessage> where TMessage : class
+{
+    private readonly Channel<TMessage> _channel =
+        Channel.CreateUnbounded<TMessage>(new UnboundedChannelOptions { SingleReader = true });
+
+    private readonly ConcurrentDictionary<Guid, TMessage> _inFlight = new();
+    private readonly Lock _delayedLock = new();
+    private readonly List<(DateTime AvailableAt, TMessage Message)> _delayed = [];
+
+    public async ValueTask EnqueueAsync(TMessage message, CancellationToken ct) =>
+        await _channel.Writer.WriteAsync(message, ct);
+
+    public async ValueTask<IReadOnlyList<PeekLock<TMessage>>> PeekLockBatchAsync(
+        int maxMessages, TimeSpan maxWait, CancellationToken ct)
+    {
+        ReleaseDueDelayedMessages();
+
+        var batch = new List<PeekLock<TMessage>>(maxMessages);
+
+        using var windowCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        windowCts.CancelAfter(maxWait);
+
+        try
+        {
+            if (!await _channel.Reader.WaitToReadAsync(windowCts.Token))
+                return batch;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return batch;
+        }
+
+        while (batch.Count < maxMessages && _channel.Reader.TryRead(out var message))
+        {
+            var lockToken = Guid.NewGuid();
+            _inFlight[lockToken] = message;
+            batch.Add(new PeekLock<TMessage>(lockToken, message));
+        }
+
+        return batch;
+    }
+
+    public ValueTask CompleteAsync(Guid lockToken, CancellationToken ct)
+    {
+        _inFlight.TryRemove(lockToken, out _);
+        return ValueTask.CompletedTask;
+    }
+
+    public async ValueTask AbandonAsync(Guid lockToken, CancellationToken ct, TimeSpan visibilityDelay = default)
+    {
+        if (!_inFlight.TryRemove(lockToken, out var message))
+            return;
+
+        if (visibilityDelay <= TimeSpan.Zero)
+        {
+            // CancellationToken.None is intentional: the caller's token may already be cancelled
+            // (e.g. host shutdown), but we must still return the message to the queue to avoid loss.
+            await _channel.Writer.WriteAsync(message, CancellationToken.None);
+            return;
+        }
+
+        lock (_delayedLock)
+            _delayed.Add((DateTime.UtcNow + visibilityDelay, message));
+    }
+
+    private void ReleaseDueDelayedMessages()
+    {
+        var now = DateTime.UtcNow;
+
+        lock (_delayedLock)
+        {
+            for (var i = _delayed.Count - 1; i >= 0; i--)
+            {
+                if (_delayed[i].AvailableAt > now)
+                    continue;
+
+                _channel.Writer.TryWrite(_delayed[i].Message);
+                _delayed.RemoveAt(i);
+            }
+        }
+    }
+}
+
+public sealed class InMemoryEventQueue : InMemoryMessageQueue<MN.Models.ProcessingMessage>, IEventQueue;
+
+public sealed class InMemoryDispatchQueue : InMemoryMessageQueue<MN.Models.DispatchMessage>, IDispatchQueue;
+
+// ============================================================
+// MN.DAL\MessageRepository.cs
+// ============================================================
+using Microsoft.EntityFrameworkCore;
+using MN.Core;
+using MN.Entities;
+using MN.Interfaces;
+
+namespace MN.DAL;
+
+public class MessageRepository(AppDbContext db) : IMessageRepository
+{
+    public async Task<NotificationMessage> CreateAsync(NotificationMessage message, CancellationToken ct)
+    {
+        db.Messages.Add(message);
+        await db.SaveChangesAsync(ct);
+        return message;
+    }
+
+    public async Task EnsureProcessingAsync(NotificationMessage message, CancellationToken ct)
+    {
+        var existing = await db.Messages
+            .FirstOrDefaultAsync(m => m.TenantId == message.TenantId && m.Id == message.Id, ct);
+
+        if (existing is null)
+        {
+            db.Messages.Add(message);
+        }
+        else
+        {
+            existing.Status = MessageStatus.Processing;
+            existing.FailureReason = null;
+        }
+
+        await db.SaveChangesAsync(ct);
+    }
+
+    public async Task<NotificationMessage?> GetByIdAsync(Guid tenantId, Guid messageId, CancellationToken ct) =>
+        await db.Messages.FirstOrDefaultAsync(m => m.TenantId == tenantId && m.Id == messageId, ct);
+
+    public async Task UpdateStatusAsync(Guid tenantId, Guid messageId, MessageStatus status, string? failureReason, CancellationToken ct)
+    {
+        var message = await db.Messages.FirstOrDefaultAsync(m => m.TenantId == tenantId && m.Id == messageId, ct);
+        if (message is null) return;
+
+        message.Status = status;
+        message.FailureReason = failureReason;
+        message.ProcessedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync(ct);
+    }
+
+    public async Task<IReadOnlyList<NotificationMessage>> GetByTenantAsync(Guid tenantId, CancellationToken ct) =>
+        await db.Messages
+            .Where(m => m.TenantId == tenantId)
+            .OrderByDescending(m => m.CreatedAt)
+            .ToListAsync(ct);
+}
+
+// ============================================================
+// MN.DAL\RoutingRuleRepository.cs
+// ============================================================
+using Microsoft.EntityFrameworkCore;
+using MN.Entities;
+using MN.Interfaces;
+
+namespace MN.DAL;
+
+public class RoutingRuleRepository(AppDbContext db) : IRoutingRuleRepository
+{
+    public async Task<RoutingRule?> GetByIdAsync(Guid tenantId, Guid ruleId, CancellationToken ct) =>
+        await db.RoutingRules.FirstOrDefaultAsync(r => r.TenantId == tenantId && r.Id == ruleId, ct);
+
+    public async Task<IReadOnlyList<RoutingRule>> GetByTenantAsync(Guid tenantId, CancellationToken ct) =>
+        await db.RoutingRules
+            .Where(r => r.TenantId == tenantId)
+            .ToListAsync(ct);
+
+    public async Task<IReadOnlyList<RoutingRule>> GetMatchingRulesAsync(Guid tenantId, string eventType, CancellationToken ct) =>
+        await db.RoutingRules
+            .Where(r => r.TenantId == tenantId && r.IsActive && r.EventType == eventType)
+            .ToListAsync(ct);
+
+    public async Task<RoutingRule?> GetByEventTypeAndChannelAsync(
+        Guid tenantId, string eventType, string channelType, CancellationToken ct) =>
+        await db.RoutingRules
+            .FirstOrDefaultAsync(r =>
+                r.TenantId == tenantId
+                && r.EventType == eventType
+                && r.ChannelType == channelType, ct);
+
+    public async Task<RoutingRule> CreateAsync(RoutingRule rule, CancellationToken ct)
+    {
+        db.RoutingRules.Add(rule);
+        await db.SaveChangesAsync(ct);
+        return rule;
+    }
+
+    public async Task<RoutingRule> UpdateAsync(RoutingRule rule, CancellationToken ct)
+    {
+        rule.UpdatedAt = DateTime.UtcNow;
+        db.RoutingRules.Update(rule);
+        await db.SaveChangesAsync(ct);
+        return rule;
+    }
+
+    public async Task DeleteAsync(Guid tenantId, Guid ruleId, CancellationToken ct)
+    {
+        var rule = await db.RoutingRules
+            .FirstOrDefaultAsync(r => r.TenantId == tenantId && r.Id == ruleId, ct);
+        if (rule is not null)
+        {
+            db.RoutingRules.Remove(rule);
+            await db.SaveChangesAsync(ct);
+        }
+    }
+}
+
+// ============================================================
+// MN.DAL\TenantContext.cs
+// ============================================================
+using MN.Interfaces;
+
+namespace MN.DAL;
+
+public class TenantContext : ITenantContext
+{
+    public Guid? CurrentTenantId { get; set; }
+    public bool IsAdminScope { get; set; } = false;
+}
+
+// ============================================================
+// MN.DAL\TenantFilteredEntityRegistry.cs
+// ============================================================
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata;
+using System.Text.RegularExpressions;
+
+namespace MN.DAL;
+
+/// <summary>
+/// Discovers entity types that carry an EF global query filter and builds SQL identifier
+/// matchers for each mapped table name.  Table names come from the EF model, not hard-coded
+/// strings, so new filtered entities are picked up automatically.
+/// </summary>
+public static class TenantFilteredEntityRegistry
+{
+    private static IReadOnlyList<FilteredEntityMatch>? _matches;
+    private static readonly Lock Sync = new();
+
+    public static IReadOnlyList<FilteredEntityMatch> GetMatches(IModel model)
+    {
+        if (_matches is not null)
+            return _matches;
+
+        lock (Sync)
+        {
+            return _matches ??= model.GetEntityTypes()
+                .Where(e => e.GetDeclaredQueryFilters().Any())
+                .Select(e => e.GetTableName())
+                .Where(name => name is not null)
+                .Select(name => new FilteredEntityMatch(name!, BuildIdentifierPattern(name!)))
+                .ToList();
+        }
+    }
+
+    /// <summary>
+    /// Resets cached matchers.  Intended for unit tests only.
+    /// </summary>
+    public static void ResetCacheForTesting() => _matches = null;
+
+    public static Regex BuildIdentifierPattern(string identifier)
+    {
+        var escaped = Regex.Escape(identifier);
+
+        // Match a SQL identifier in common provider formats (quoted, bracketed, or bare word).
+        // Aliases such as FROM "RoutingRules" AS "r" still contain the quoted table token.
+        var pattern =
+            $"""(?<![\w\[\]"`])(?:\[{escaped}\]|"{escaped}"|`{escaped}`|\b{escaped}\b)(?![\w\[\]"`])""";
+
+        return new Regex(pattern, RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    }
+
+    public static string StripSqlComments(string sql)
+    {
+        var withoutBlocks = Regex.Replace(sql, @"/\*.*?\*/", " ", RegexOptions.Singleline);
+        return Regex.Replace(withoutBlocks, @"--[^\r\n]*", " ");
+    }
+}
+
+public readonly record struct FilteredEntityMatch(string TableName, Regex Pattern);
+
+// ============================================================
+// MN.DAL\TenantRepository.cs
+// ============================================================
+using Microsoft.EntityFrameworkCore;
+using MN.Entities;
+using MN.Interfaces;
+
+namespace MN.DAL;
+
+public class TenantRepository(AppDbContext db) : ITenantRepository
+{
+    public async Task<Tenant?> GetByIdAsync(Guid id, CancellationToken ct) =>
+        await db.Tenants.FirstOrDefaultAsync(t => t.Id == id, ct);
+
+    public async Task<Tenant?> GetByNameAsync(string name, CancellationToken ct) =>
+        await db.Tenants.FirstOrDefaultAsync(t => t.Name == name, ct);
+
+    public async Task<IReadOnlyList<Tenant>> GetAllAsync(CancellationToken ct) =>
+        await db.Tenants.OrderBy(t => t.Name).ToListAsync(ct);
+
+    public async Task<Tenant> CreateAsync(Tenant tenant, CancellationToken ct)
+    {
+        db.Tenants.Add(tenant);
+        await db.SaveChangesAsync(ct);
+        return tenant;
+    }
+
+    public async Task<Tenant> UpdateAsync(Tenant tenant, CancellationToken ct)
+    {
+        tenant.UpdatedAt = DateTime.UtcNow;
+        db.Tenants.Update(tenant);
+        await db.SaveChangesAsync(ct);
+        return tenant;
+    }
+
+    public async Task DeleteAsync(Guid id, CancellationToken ct)
+    {
+        var tenant = await db.Tenants.FindAsync([id], ct);
+        if (tenant is not null)
+        {
+            db.Tenants.Remove(tenant);
+            await db.SaveChangesAsync(ct);
+        }
+    }
+
+    public async Task<bool> ExistsAsync(Guid id, CancellationToken ct) =>
+        await db.Tenants.AnyAsync(t => t.Id == id && t.IsActive, ct);
+}
+
+// ============================================================
+// MN.DAL\TenantSessionContextInterceptor.cs
+// ============================================================
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using MN.Interfaces;
+using System.Data.Common;
+
+namespace MN.DAL;
+
+/// <summary>
+/// No-op locally (SQLite has no SESSION_CONTEXT support).
+///
+/// In production against Azure SQL with Row-Level Security, replace the no-op bodies with
+/// an invocation of sp_set_session_context:
+///
+///   await command.Connection!.ExecuteAsync(
+///       "EXEC sp_set_session_context @key = N'TenantId', @value = @tid",
+///       new { tid = tenantContext.CurrentTenantId });
+///
+/// This bakes tenant isolation into the database engine itself, providing defense-in-depth
+/// independent of any application-layer filtering.
+/// </summary>
+public class TenantSessionContextInterceptor : DbCommandInterceptor
+{
+    public TenantSessionContextInterceptor(ITenantContext tenantContext)
+    {
+        // Retained for documentation and future production wiring; no-op on SQLite.
+        _ = tenantContext;
+    }
+
+    public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+        DbCommand command,
+        CommandEventData eventData,
+        InterceptionResult<DbDataReader> result,
+        CancellationToken ct = default) =>
+        ValueTask.FromResult(result);
+}
+
+// ============================================================
+// MN.DAL\UnscopedTenantQueryInterceptor.cs
+// ============================================================
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.Extensions.Logging;
+using MN.Interfaces;
+using System.Data.Common;
+
+namespace MN.DAL;
+
+/// <summary>
+/// Detects SELECTs against tenant-filtered tables when no tenant context is set.  The EF
+/// global query filters silently return empty results in this state â€” in DEBUG builds this
+/// interceptor throws to surface the bug immediately; in Release it logs a warning.
+/// </summary>
+public class UnscopedTenantQueryInterceptor(
+    ITenantContext tenantContext,
+    ILogger<UnscopedTenantQueryInterceptor> logger) : DbCommandInterceptor
+{
+    public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+        DbCommand command,
+        CommandEventData eventData,
+        InterceptionResult<DbDataReader> result,
+        CancellationToken cancellationToken = default)
+    {
+        WarnIfUnscoped(command, eventData.Context);
+        return base.ReaderExecutingAsync(command, eventData, result, cancellationToken);
+    }
+
+    public override InterceptionResult<DbDataReader> ReaderExecuting(
+        DbCommand command,
+        CommandEventData eventData,
+        InterceptionResult<DbDataReader> result)
+    {
+        WarnIfUnscoped(command, eventData.Context);
+        return base.ReaderExecuting(command, eventData, result);
+    }
+
+    private void WarnIfUnscoped(DbCommand command, DbContext? context)
+    {
+        if (tenantContext.IsAdminScope || tenantContext.CurrentTenantId.HasValue)
+            return;
+
+        if (context is null)
+        {
+            logger.LogDebug(
+                "Skipping unscoped tenant query check: DbContext unavailable for command. SQL: {Sql}",
+                command.CommandText);
+            return;
+        }
+
+        var sql = TenantFilteredEntityRegistry.StripSqlComments(command.CommandText);
+
+        // with more time - i think there is a way to inspect the guts of the EF query
+        // in a more robust way; would like to explore that instead.  SQL inspection
+        // on every select has performance implications i'd rather avoid.
+
+        foreach (var match in TenantFilteredEntityRegistry.GetMatches(context.Model))
+        {
+            if (!match.Pattern.IsMatch(sql))
+                continue;
+
+#if DEBUG
+            throw new InvalidOperationException(
+                $"Query against tenant-filtered table '{match.TableName}' executed with no tenant context set. " +
+                "Results would be empty. Set ITenantContext.CurrentTenantId or IsAdminScope = true before " +
+                $"querying this table. SQL: {command.CommandText}");
+#else
+            logger.LogWarning(
+                "Query against tenant-filtered table {Table} executed with no tenant context set. " +
+                "Results will be empty. Ensure ITenantContext.CurrentTenantId or IsAdminScope is " +
+                "configured before querying this table. If this is intentional, set IsAdminScope = true. " +
+                "SQL: {Sql}",
+                match.TableName,
+                command.CommandText);
+#endif
+        }
+    }
+}
+
+// ============================================================
+// MN.Entities\DispatchOutboxEntry.cs
+// ============================================================
+namespace MN.Entities;
+
+/// <summary>
+/// Transactional outbox for dispatch queue publish. Written in the same commit as
+/// <see cref="NotificationDispatch"/>; a background worker enqueues then marks published.
+/// </summary>
+public class DispatchOutboxEntry : ITenantScoped
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid OriginalMessageId { get; set; }
+    public Guid RuleId { get; set; }
+    public string ChannelType { get; set; } = string.Empty;
+    public int SchemaVersion { get; set; }
+    public string EventType { get; set; } = string.Empty;
+    public string Payload { get; set; } = string.Empty;
+    public DateTime MessageCreatedAt { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime? PublishedAt { get; set; }
+    /// <summary>Exclusive publish lease â€” set by TryClaim; cleared on MarkPublished or expiry.</summary>
+    public DateTime? ClaimedUntil { get; set; }
+    public string? ClaimedBy { get; set; }
+}
+
+// ============================================================
+// MN.Entities\ITenantScoped.cs
+// ============================================================
+namespace MN.Entities;
+
+public interface ITenantScoped
+{
+    Guid TenantId { get; set; }
+}
+
+// ============================================================
+// MN.Entities\NotificationDispatch.cs
+// ============================================================
+using MN.Core;
+
+namespace MN.Entities;
+
+public class NotificationDispatch : ITenantScoped
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid OriginalMessageId { get; set; }
+    public Guid RuleId { get; set; }
+    public string ChannelType { get; set; } = string.Empty;
+    public DispatchStatus Status { get; set; } = DispatchStatus.Pending;
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime? ProcessedAt { get; set; }
+}
+
+// ============================================================
+// MN.Entities\NotificationMessage.cs
+// ============================================================
+using System.ComponentModel.DataAnnotations.Schema;
+using MN.Core;
+
+namespace MN.Entities;
+
+public class NotificationMessage : ITenantScoped
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public int SchemaVersion { get; set; } = MessageSchemaVersion.Current;
+    public string EventType { get; set; } = string.Empty;
+    public string Payload { get; set; } = string.Empty;
+    public MessageStatus Status { get; set; } = MessageStatus.Processing;
+    public string? FailureReason { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime? ProcessedAt { get; set; }
+}
+
+// ============================================================
+// MN.Entities\RoutingRule.cs
+// ============================================================
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace MN.Entities;
+
+/// <summary>
+/// Maps an event type to a channel for a tenant. Unique (TenantId, EventType, ChannelType)
+/// allows multi-channel dispatch per ingest while preventing duplicate rules per channel.
+/// </summary>
+public class RoutingRule : ITenantScoped
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public string EventType { get; set; } = string.Empty;
+
+    public string ChannelType { get; set; } = string.Empty;
+
+    public bool IsActive { get; set; } = true;
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+
+    public Tenant Tenant { get; set; } = null!;
+
+    // below - possible routing rule implementations, finalization subject to
+    // further requirements gathering.  who are we building this for and why?
+    // public ICollection<RoutingRuleChannelConfig> ChannelConfigs { get; set; } = new List<RoutingRuleChannelConfig>();
+    // public ICollection<RoutingRulePayloadCriteria> PayloadCriteria { get; set; } = new List<RoutingRulePayloadCriteria>();
+}
+
+public class RoutingRuleChannelConfig : ITenantScoped
+{
+    public Guid Id { get; set; }
+    public Guid RoutingRuleId { get; set; }
+    public Guid TenantId { get; set; }
+
+    /// <summary>Config key, e.g. "webhook_url", "channel", "connector_url".</summary>
+    public string Key { get; set; } = string.Empty;
+
+    /// <summary>Config value. Stored as plaintext; secrets should be replaced with a vault reference in production.</summary>
+    public string Value { get; set; } = string.Empty;
+
+    public RoutingRule RoutingRule { get; set; } = null!;
+}
+
+public enum PayloadCriteriaOperator 
+{
+    Equals,
+    StartsWith,
+    EndsWith
+}
+
+public class RoutingRulePayloadCriteria : ITenantScoped 
+{
+    public Guid Id { get; set; }
+    public Guid RoutingRuleId { get; set; }
+    public Guid TenantId { get; set; }
+
+    // e.g. data.order.id
+    public string PayloadPath { get; set; }
+    public PayloadCriteriaOperator Operator { get; set; }
+    public string Value { get; set; }
+}
+
+
+
+// ============================================================
+// MN.Entities\Tenant.cs
+// ============================================================
+namespace MN.Entities;
+
+public class Tenant
+{
+    public Guid Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public bool IsActive { get; set; } = true;
+    public int RateLimitPerMinute { get; set; } = 60;
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+
+    public ICollection<RoutingRule> RoutingRules { get; set; } = new List<RoutingRule>();
+}
+
+// ============================================================
+// MN.Interfaces\IDeadLetterQueue.cs
+// ============================================================
+using MN.Models;
+
+namespace MN.Interfaces;
+
+public interface IDeadLetterQueue
+{
+    ValueTask SendAsync(DeadLetterMessage message, CancellationToken ct);
+    IReadOnlyList<DeadLetterMessage> GetAll();
+    IReadOnlyList<DeadLetterMessage> GetByTenant(Guid tenantId);
+}
+
+// ============================================================
+// MN.Interfaces\IDispatchOutboxRepository.cs
+// ============================================================
+using MN.Entities;
+
+namespace MN.Interfaces;
+
+public interface IDispatchOutboxRepository
+{
+    /// <summary>
+    /// Atomically claims up to <paramref name="max"/> unpublished rows for this publisher instance.
+    /// Rows with an active lease held by another instance are skipped.
+    /// </summary>
+    Task<IReadOnlyList<DispatchOutboxEntry>> TryClaimUnpublishedAcrossTenantsAsync(
+        int max, string claimerId, CancellationToken ct);
+
+    Task MarkPublishedAsync(IReadOnlyList<Guid> ids, string claimerId, CancellationToken ct);
+}
+
+// ============================================================
+// MN.Interfaces\IDispatchRepository.cs
+// ============================================================
+using MN.Core;
+using MN.Entities;
+using MN.Models;
+
+namespace MN.Interfaces;
+
+public interface IDispatchRepository
+{
+    /// <summary>
+    /// Idempotently creates dispatch + outbox rows for matched rules in one commit.
+    /// Returns the count of outbox entries awaiting publish (new or reset).
+    /// </summary>
+    Task<int> PrepareDispatchesForRoutingAsync(
+        ProcessingMessage message,
+        IReadOnlyList<RoutingRule> rules,
+        CancellationToken ct);
+
+    Task<NotificationDispatch?> GetByIdAsync(Guid tenantId, Guid dispatchId, CancellationToken ct);
+
+    Task UpdateStatusAsync(Guid tenantId, Guid dispatchId, DispatchStatus status, CancellationToken ct);
+
+    Task<IReadOnlyList<NotificationDispatch>> GetByOriginalMessageAsync(
+        Guid tenantId, Guid originalMessageId, CancellationToken ct);
+}
+
+// ============================================================
+// MN.Interfaces\IIngestionService.cs
+// ============================================================
+using MN.Models;
+
+namespace MN.Interfaces;
+
+public interface IIngestionService
+{
+    Task<IngestEventResponse> IngestAsync(IngestEventRequest request, CancellationToken ct);
+}
+
+// ============================================================
+// MN.Interfaces\IMessageDispatcher.cs
+// ============================================================
+using MN.Entities;
+using MN.Models;
+
+namespace MN.Interfaces;
+
+public interface IMessageDispatcher
+{
+    Task DispatchAsync(DispatchMessage dispatch, RoutingRule rule, CancellationToken ct);
+}
+
+// ============================================================
+// MN.Interfaces\IMessageQueue.cs
+// ============================================================
+namespace MN.Interfaces;
+
+public interface IMessageQueue<TMessage> where TMessage : class
+{
+    ValueTask EnqueueAsync(TMessage message, CancellationToken ct);
+
+    /// <summary>
+    /// Peek-locks up to <paramref name="maxMessages"/> messages within the given
+    /// <paramref name="maxWait"/> window. Locked messages are held in-flight and
+    /// invisible to other consumers until completed or abandoned.
+    /// Models Azure Service Bus ReceiveMessagesAsync with peek-lock mode.
+    /// </summary>
+    ValueTask<IReadOnlyList<PeekLock<TMessage>>> PeekLockBatchAsync(
+        int maxMessages, TimeSpan maxWait, CancellationToken ct);
+
+    ValueTask CompleteAsync(Guid lockToken, CancellationToken ct);
+
+    /// <summary>
+    /// Returns the message to the queue for retry. When <paramref name="visibilityDelay"/>
+    /// is non-zero, the message is held invisible until the delay elapses â€” models ASB
+    /// scheduled redelivery and prevents immediate hot-loop reprocessing.
+    /// </summary>
+    ValueTask AbandonAsync(Guid lockToken, CancellationToken ct, TimeSpan visibilityDelay = default);
+}
+
+public interface IEventQueue : IMessageQueue<MN.Models.ProcessingMessage> { }
+
+public interface IDispatchQueue : IMessageQueue<MN.Models.DispatchMessage> { }
+
+// ============================================================
+// MN.Interfaces\IMessageRepository.cs
+// ============================================================
+using MN.Entities;
+using MN.Core;
+
+namespace MN.Interfaces;
+
+public interface IMessageRepository
+{
+    Task<NotificationMessage> CreateAsync(NotificationMessage message, CancellationToken ct);
+
+    /// <summary>
+    /// Idempotent write keyed by (TenantId, Id). Inserts on first processing attempt;
+    /// on redelivery resets status to Processing without duplicating the row.
+    /// </summary>
+    Task EnsureProcessingAsync(NotificationMessage message, CancellationToken ct);
+
+    Task<NotificationMessage?> GetByIdAsync(Guid tenantId, Guid messageId, CancellationToken ct);
+    Task UpdateStatusAsync(Guid tenantId, Guid messageId, MessageStatus status, string? failureReason, CancellationToken ct);
+    Task<IReadOnlyList<NotificationMessage>> GetByTenantAsync(Guid tenantId, CancellationToken ct);
+}
+
+// ============================================================
+// MN.Interfaces\INotificationChannel.cs
+// ============================================================
+using MN.Entities;
+using MN.Models;
+
+namespace MN.Interfaces;
+
+public interface INotificationChannel
+{
+    string ChannelType { get; }
+    Task SendAsync(DispatchMessage dispatch, RoutingRule rule, CancellationToken ct);
+}
+
+// ============================================================
+// MN.Interfaces\IRateLimiterService.cs
+// ============================================================
+using MN.Core;
+
+namespace MN.Interfaces;
+
+public interface IRateLimiterService
+{
+    AcquireResult TryAcquire(Guid tenantId);
+    void ConfigureTenant(Guid tenantId, int requestsPerMinute);
+    void RemoveTenant(Guid tenantId);
+}
+
+// ============================================================
+// MN.Interfaces\IRoutingRuleRepository.cs
+// ============================================================
+using MN.Entities;
+
+namespace MN.Interfaces;
+
+public interface IRoutingRuleRepository
+{
+    Task<RoutingRule?> GetByIdAsync(Guid tenantId, Guid ruleId, CancellationToken ct);
+    Task<IReadOnlyList<RoutingRule>> GetByTenantAsync(Guid tenantId, CancellationToken ct);
+    Task<IReadOnlyList<RoutingRule>> GetMatchingRulesAsync(Guid tenantId, string eventType, CancellationToken ct);
+    Task<RoutingRule?> GetByEventTypeAndChannelAsync(Guid tenantId, string eventType, string channelType, CancellationToken ct);
+    Task<RoutingRule> CreateAsync(RoutingRule rule, CancellationToken ct);
+    Task<RoutingRule> UpdateAsync(RoutingRule rule, CancellationToken ct);
+    Task DeleteAsync(Guid tenantId, Guid ruleId, CancellationToken ct);
+}
+
+// ============================================================
+// MN.Interfaces\ITenantContext.cs
+// ============================================================
+namespace MN.Interfaces;
+
+public interface ITenantContext
+{
+    Guid? CurrentTenantId { get; set; }
+
+    /// <summary>
+    /// Explicit opt-in to bypass EF global query filters for cross-tenant admin operations.
+    /// Default is false (fail-closed): queries on filtered tables return nothing unless
+    /// CurrentTenantId is set or this flag is explicitly set to true.
+    /// </summary>
+    bool IsAdminScope { get; set; }
+}
+
+// ============================================================
+// MN.Interfaces\ITenantRepository.cs
+// ============================================================
+using MN.Entities;
+
+namespace MN.Interfaces;
+
+public interface ITenantRepository
+{
+    Task<Tenant?> GetByIdAsync(Guid id, CancellationToken ct);
+    Task<Tenant?> GetByNameAsync(string name, CancellationToken ct);
+    Task<IReadOnlyList<Tenant>> GetAllAsync(CancellationToken ct);
+    Task<Tenant> CreateAsync(Tenant tenant, CancellationToken ct);
+    Task<Tenant> UpdateAsync(Tenant tenant, CancellationToken ct);
+    Task DeleteAsync(Guid id, CancellationToken ct);
+    Task<bool> ExistsAsync(Guid id, CancellationToken ct);
+}
+
+// ============================================================
+// MN.Interfaces\PeekLock.cs
+// ============================================================
+namespace MN.Interfaces;
+
+/// <summary>
+/// A peek-locked message: held in-flight until completed (success) or abandoned (retry).
+/// Models Azure Service Bus peek-lock semantics.
+/// </summary>
+public record PeekLock<TMessage>(Guid LockToken, TMessage Message) where TMessage : class;
+
+// ============================================================
+// MN.Models\DeadLetterMessage.cs
+// ============================================================
+namespace MN.Models;
+
+public class DeadLetterMessage
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public Guid OriginalMessageId { get; set; }
+    public Guid? DispatchId { get; set; }
+    public string? ChannelType { get; set; }
+    public int SchemaVersion { get; set; } = 1;
+    public string EventType { get; set; } = string.Empty;
+    public string Payload { get; set; } = string.Empty;
+    public string FailureReason { get; set; } = string.Empty;
+    public DateTime FailedAt { get; set; } = DateTime.UtcNow;
+}
+
+// ============================================================
+// MN.Models\DeadLetterModels.cs
+// ============================================================
+namespace MN.Models;
+
+public record DeadLetterResponse(
+    Guid Id,
+    Guid TenantId,
+    Guid OriginalMessageId,
+    Guid? DispatchId,
+    string? ChannelType,
+    string EventType,
+    string Payload,
+    string FailureReason,
+    DateTime FailedAt);
+
+// ============================================================
+// MN.Models\DispatchMessage.cs
+// ============================================================
+namespace MN.Models;
+
+public record DispatchMessage(
+    Guid Id,
+    Guid OriginalMessageId,
+    Guid TenantId,
+    Guid RuleId,
+    string ChannelType,
+    int SchemaVersion,
+    string EventType,
+    string Payload,
+    DateTime CreatedAt)
+{
+    public int DeliveryAttempts { get; set; }
+
+    public static Guid CreateId(Guid originalMessageId, Guid ruleId)
+    {
+        Span<byte> bytes = stackalloc byte[32];
+        originalMessageId.TryWriteBytes(bytes[..16]);
+        ruleId.TryWriteBytes(bytes[16..]);
+        var hash = System.Security.Cryptography.SHA256.HashData(bytes);
+        return new Guid(hash[..16]);
+    }
+}
+
+// ============================================================
+// MN.Models\EventModels.cs
+// ============================================================
+namespace MN.Models;
+
+public record IngestEventRequest(
+    Guid TenantId,
+    string EventType,
+    string Payload);
+
+public record IngestEventResponse(Guid MessageId);
+
+// ============================================================
+// MN.Models\ProcessingMessage.cs
+// ============================================================
+namespace MN.Models;
+
+
+public class ProcessingMessage(
+    Guid Id,
+    Guid TenantId,
+    int SchemaVersion,
+    string EventType,
+    string Payload,
+    DateTime CreatedAt)
+{
+    public Guid Id { get; } = Id;
+    public Guid TenantId { get; } = TenantId;
+    public int SchemaVersion { get; } = SchemaVersion;
+    public string EventType { get; } = EventType;
+    public string Payload { get; } = Payload;
+    public DateTime CreatedAt { get; } = CreatedAt;
+
+    /// <summary>
+    /// Incremented per delivery attempt. On ASB, initialize from
+    /// <c>ServiceBusReceivedMessage.DeliveryCount</c> when building this model.
+    /// <see cref="Id"/> is the idempotency key for DB upserts (set ASB MessageId to the same
+    /// value on send for correlation; broker envelope id is not the business message identity).
+    /// </summary>
+    public int DeliveryAttempts { get; set; } = 0;
+}
+
+// ============================================================
+// MN.Models\RoutingRuleModels.cs
+// ============================================================
+namespace MN.Models;
+
+public record CreateRoutingRuleRequest(
+    string EventType,
+    string ChannelType);
+
+public record UpdateRoutingRuleRequest(
+    string? EventType,
+    string? ChannelType,
+    bool? IsActive);
+
+public record RoutingRuleResponse(
+    Guid Id,
+    Guid TenantId,
+    string EventType,
+    string ChannelType,
+    bool IsActive,
+    DateTime CreatedAt);
+
+// ============================================================
+// MN.Models\TenantModels.cs
+// ============================================================
+namespace MN.Models;
+
+public record CreateTenantRequest(string Name, int RateLimitPerMinute = 60);
+
+public record UpdateTenantRequest(string? Name, int? RateLimitPerMinute, bool? IsActive);
+
+public record TenantResponse(
+    Guid Id,
+    string Name,
+    bool IsActive,
+    int RateLimitPerMinute,
+    DateTime CreatedAt);
+
+// ============================================================
+// MN.Tests\CustomWebApplicationFactory.cs
+// ============================================================
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.Configuration;
+
+namespace MN.Tests;
+
+/// <summary>
+/// Spins up the real application pipeline in-process against a private temp SQLite file,
+/// so each factory instance starts with a clean, isolated database.
+/// </summary>
+public class CustomWebApplicationFactory : WebApplicationFactory<Program>
+{
+    private readonly string _dbPath =
+        Path.Combine(Path.GetTempPath(), $"mn-test-{Guid.NewGuid():N}.db");
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.ConfigureAppConfiguration(config =>
+            config.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["ConnectionStrings:DefaultConnection"] = $"Data Source={_dbPath}"
+            }));
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        base.Dispose(disposing);
+        if (!disposing) return;
+        foreach (var suffix in new[] { "", "-shm", "-wal" })
+        {
+            var path = _dbPath + suffix;
+            if (File.Exists(path))
+                try { File.Delete(path); } catch { /* best effort */ }
+        }
+    }
+}
+
+// ============================================================
+// MN.Tests\DependencyInjectionTests.cs
+// ============================================================
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.DependencyInjection;
+
+namespace MN.Tests;
+
+/// <summary>
+/// Validates the DI container's service graph at build time.
+///
+/// The core risk: a singleton that captures a scoped ITenantContext shares one tenant
+/// identity for the lifetime of the process â€” every request would read/write as that
+/// tenant, a total isolation failure. ASP.NET Core's scope validation catches this
+/// class of mistake if you ask it to.
+///
+/// These tests re-build the service collection with ValidateScopes + ValidateOnBuild
+/// both enabled. If any singleton takes a scoped dependency (directly or transitively)
+/// the provider throws InvalidOperationException at Build() time, not at runtime.
+/// </summary>
+public class DependencyInjectionTests
+{
+    /// <summary>
+    /// Building the service provider with strict scope validation must not throw.
+    /// Any singleton that directly or transitively depends on ITenantContext (scoped)
+    /// will fail here before it can cause a tenant isolation bug in production.
+    /// </summary>
+    [Fact]
+    public void ServiceProvider_WithScopeValidation_BuildsWithoutError()
+    {
+        IServiceCollection? captured = null;
+
+        using var factory = new CapturingWebApplicationFactory(services =>
+        {
+            captured = services;
+        });
+
+        // Force the host to build so ConfigureServices callbacks run.
+        _ = factory.Services;
+
+        Assert.NotNull(captured);
+
+        var exception = Record.Exception(() =>
+            captured.BuildServiceProvider(new ServiceProviderOptions
+            {
+                ValidateScopes = true,
+                ValidateOnBuild = true
+            }));
+
+        Assert.Null(exception);
+    }
+
+    /// <summary>
+    /// Explicitly asserts that every singleton service in the container does NOT have
+    /// ITenantContext as a direct constructor dependency. This is a belt-and-suspenders
+    /// check: ValidateOnBuild catches transitive scope violations; this catches the
+    /// most direct and readable version of the mistake and produces a clearer failure
+    /// message that names the offending type.
+    /// </summary>
+    [Fact]
+    public void Singleton_Services_DoNotDirectlyDependOn_ITenantContext()
+    {
+        IServiceCollection? captured = null;
+
+        using var factory = new CapturingWebApplicationFactory(services =>
+        {
+            captured = services;
+        });
+
+        _ = factory.Services;
+
+        Assert.NotNull(captured);
+
+        var singletonImplementationTypes = captured
+            .Where(d => d.Lifetime == ServiceLifetime.Singleton)
+            .Select(d => d.ImplementationType)
+            .Where(t => t is not null)
+            .ToList();
+
+        var tenantContextType = typeof(MN.Interfaces.ITenantContext);
+
+        var offenders = singletonImplementationTypes
+            .Where(implType => implType!
+                .GetConstructors()
+                .Any(ctor => ctor.GetParameters()
+                    .Any(p => tenantContextType.IsAssignableFrom(p.ParameterType))))
+            .ToList();
+
+        Assert.True(
+            offenders.Count == 0,
+            $"The following singleton(s) directly inject ITenantContext (scoped), " +
+            $"which would cause all requests to share the same tenant identity:\n" +
+            string.Join("\n", offenders.Select(t => $"  - {t!.FullName}")));
+    }
+
+    // Minimal factory subclass that captures the IServiceCollection before the host
+    // builds it. We deliberately don't extend CustomWebApplicationFactory so this test
+    // doesn't inherit its SQLite file setup/teardown overhead.
+    private sealed class CapturingWebApplicationFactory(Action<IServiceCollection> onConfigure)
+        : WebApplicationFactory<Program>
+    {
+        private readonly string _connectionString =
+            $"Data Source=di-test-{Guid.NewGuid():N};Mode=Memory;Cache=Shared";
+        private SqliteConnection? _keepAlive;
+
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            // Keep one connection open for the factory's lifetime so the shared-cache
+            // in-memory database isn't destroyed between EnsureCreated() and the
+            // Tenants query that runs during app startup.
+            _keepAlive = new SqliteConnection(_connectionString);
+            _keepAlive.Open();
+
+            builder.ConfigureServices(onConfigure);
+
+            // Point at an in-memory DB so no file is created on disk.
+            builder.UseSetting("ConnectionStrings:DefaultConnection", _connectionString);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                _keepAlive?.Dispose();
+            base.Dispose(disposing);
+        }
+    }
+}
+
+// ============================================================
+// MN.Tests\EntityContractTests.cs
+// ============================================================
+using System.Reflection;
+using MN.Entities;
+
+namespace MN.Tests;
+
+public class EntityContractTests
+{
+    [Fact]
+    public void AllEntitiesWithTenantId_MustImplementITenantScoped()
+    {
+        // this is flawed.  there's a better way - EF exposes a list of all
+        // entities that FK to TenantId, we could drive off that instead of
+        // tenantId string matching
+
+        var entityTypes = typeof(RoutingRule).Assembly
+            .GetExportedTypes()
+            .Where(t => t.IsClass && !t.IsAbstract)
+            .Where(t => t.GetProperty("TenantId", BindingFlags.Public | BindingFlags.Instance) is not null)
+            .ToList();
+
+        var violations = entityTypes
+            .Where(t => !typeof(ITenantScoped).IsAssignableFrom(t))
+            .Select(t => t.Name)
+            .ToList();
+
+        Assert.True(
+            violations.Count == 0,
+            $"The following types have a TenantId property but do not implement ITenantScoped: {string.Join(", ", violations)}");
+    }
+
+    // there should be another test here that validates query filters exist
+    // on the tenant ID entities, excluding the outbox (that needs cross-tenant reads)
+}
+
+// ============================================================
+// MN.Tests\OutboxClaimTests.cs
+// ============================================================
+using Microsoft.EntityFrameworkCore;
+using MN.DAL;
+using MN.Entities;
+
+namespace MN.Tests;
+
+public class OutboxClaimTests : IDisposable
+{
+    private readonly string _dbPath =
+        Path.Combine(Path.GetTempPath(), $"mn-outbox-claim-{Guid.NewGuid():N}.db");
+    private readonly TenantContext _tenantContext = new();
+
+    [Fact]
+    public async Task TryClaim_sameRow_onlyOnePublisherClaimsIt()
+    {
+        await SeedOutboxRowsAsync(1);
+
+        var claims = await Task.WhenAll(
+            TryClaimAsync("publisher-a", max: 1),
+            TryClaimAsync("publisher-b", max: 1),
+            TryClaimAsync("publisher-c", max: 1));
+
+        var allClaimed = claims.SelectMany(c => c).ToList();
+        Assert.Single(allClaimed);
+    }
+
+    [Fact]
+    public async Task MarkPublished_onlyHonorsMatchingClaimer()
+    {
+        await SeedOutboxRowsAsync(1);
+
+        var claimed = await TryClaimAsync("owner", max: 1);
+        Assert.Single(claimed);
+
+        await using var context = CreateContext();
+        var repo = new DispatchOutboxRepository(context);
+        await repo.MarkPublishedAsync([claimed[0].Id], "other-publisher", CancellationToken.None);
+
+        var row = await context.DispatchOutbox.SingleAsync(o => o.Id == claimed[0].Id);
+        Assert.Null(row.PublishedAt);
+        Assert.Equal("owner", row.ClaimedBy);
+    }
+
+    [Fact]
+    public async Task TryClaim_batchClaimsUpToMaxRows()
+    {
+        await SeedOutboxRowsAsync(5);
+
+        var claimed = await TryClaimAsync("publisher-a", max: 50);
+        Assert.Equal(5, claimed.Count);
+    }
+
+    private async Task SeedOutboxRowsAsync(int count)
+    {
+        var tenantId = Guid.NewGuid();
+        _tenantContext.CurrentTenantId = tenantId;
+        await using var context = CreateContext();
+        await context.Database.EnsureCreatedAsync();
+        for (var i = 0; i < count; i++)
+        {
+            context.DispatchOutbox.Add(new DispatchOutboxEntry
+            {
+                Id = Guid.NewGuid(),
+                TenantId = tenantId,
+                OriginalMessageId = Guid.NewGuid(),
+                RuleId = Guid.NewGuid(),
+                ChannelType = "slack",
+                SchemaVersion = 1,
+                EventType = "test.event",
+                Payload = "{}",
+                MessageCreatedAt = DateTime.UtcNow.AddMilliseconds(-count + i),
+                CreatedAt = DateTime.UtcNow.AddMilliseconds(-count + i)
+            });
+        }
+
+        await context.SaveChangesAsync();
+    }
+
+    private async Task<IReadOnlyList<DispatchOutboxEntry>> TryClaimAsync(string claimerId, int max)
+    {
+        await using var context = CreateContext();
+        var repo = new DispatchOutboxRepository(context);
+        return await repo.TryClaimUnpublishedAcrossTenantsAsync(max, claimerId, CancellationToken.None);
+    }
+
+    private AppDbContext CreateContext()
+    {
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite($"Data Source={_dbPath}")
+            .Options;
+        return new AppDbContext(options, _tenantContext);
+    }
+
+    public void Dispose()
+    {
+        foreach (var suffix in new[] { "", "-shm", "-wal" })
+        {
+            var path = _dbPath + suffix;
+            if (File.Exists(path))
+                try { File.Delete(path); } catch { /* best effort */ }
+        }
+    }
+}
+
+// ============================================================
+// MN.Tests\RateLimitSurfaceAreaTests.cs
+// ============================================================
+using System.Reflection;
+using MN.Core;
+
+namespace MN.Tests;
+
+// the idea here is to just force devs to think about rate limiters
+// when adding new channels
+
+public class RateLimitSurfaceAreaTests
+{
+    [Fact]
+    public void SharedRateLimiter_surfaceArea_mustNotExceedConfiguredMaximumWhenChannelsGrow()
+    {
+        var channelCount = CountChannelTypeMembers();
+        var surfaceArea = channelCount * RateLimitConstants.PermitsConsumedPerChannel;
+
+        if (surfaceArea > RateLimitConstants.MaxRateLimitSurfaceArea)
+        {
+            throw new InvalidOperationException(
+                $"Rate limit surface area {surfaceArea} ({channelCount} channel type(s) Ã— " +
+                $"{RateLimitConstants.PermitsConsumedPerChannel}) exceeds configured maximum " +
+                $"{RateLimitConstants.MaxRateLimitSurfaceArea}. New channel added â€” re-evaluate shared vs " +
+                "split per-tenant limiters, bump RateLimitConstants.MaxRateLimitSurfaceArea, and update " +
+                "docs/adrs/011-shared-ingest-and-delivery-rate-limiting.md.");
+        }
+
+        Assert.Equal(RateLimitConstants.MaxRateLimitSurfaceArea, surfaceArea);
+    }
+
+    private static int CountChannelTypeMembers() =>
+        typeof(ChannelTypes)
+            .GetFields(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly)
+            .Count(f => f is { IsLiteral: true, FieldType: var t } && t == typeof(string));
+}
+
+// ============================================================
+// MN.Tests\TenantIsolationTests.cs
+// ============================================================
+using System.Net;
+using System.Net.Http.Json;
+using System.Text.Json;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using MN.BusinessLogic;
+using MN.Core;
+using MN.Entities;
+using MN.Interfaces;
+using MN.Models;
+
+namespace MN.Tests;
+
+/// <summary>
+/// Verifies the three core tenant isolation guarantees:
+///   1. Tenant B cannot see Tenant A's routing rules (data isolation).
+///   2. Tenant B's events are not dispatched by Tenant A's rules (dispatch isolation).
+///   3. Tenant A exhausting its rate limit does not block Tenant B (resource isolation).
+/// </summary>
+public class TenantIsolationTests(CustomWebApplicationFactory factory)
+    : IClassFixture<CustomWebApplicationFactory>
+{
+    private readonly HttpClient _client = factory.CreateClient();
+
+    [Fact]
+    public async Task TenantB_CannotSee_TenantAs_Rules()
+    {
+        var tenantA = await CreateTenantAsync(100);
+        await CreateRuleAsync(tenantA, "order.created", "slack");
+
+        var tenantB = await CreateTenantAsync(100);
+
+        var response = await _client.GetAsync($"/api/tenants/{tenantB}/rules");
+        response.EnsureSuccessStatusCode();
+
+        var rules = await response.Content.ReadFromJsonAsync<JsonElement[]>();
+        Assert.Empty(rules!);
+    }
+
+    [Fact]
+    public async Task TenantB_Event_IsDeadLettered_WhenOnlyTenantA_HasMatchingRule()
+    {
+        var tenantA = await CreateTenantAsync(100);
+        await CreateRuleAsync(tenantA, "order.created", "slack");
+
+        var tenantB = await CreateTenantAsync(100);
+
+        var ingestResponse = await IngestEventAsync(tenantB, "order.created", new { orderId = "x" });
+        Assert.Equal(HttpStatusCode.Accepted, ingestResponse.StatusCode);
+
+        var deadLetters = await PollDeadLettersAsync(tenantB, expectedCount: 1, TimeSpan.FromSeconds(5));
+        Assert.Single(deadLetters);
+        Assert.Equal(JsonValueKind.Null, deadLetters[0].GetProperty("dispatchId").ValueKind);
+        Assert.Contains(
+            "No matching routing rules",
+            deadLetters[0].GetProperty("failureReason").GetString());
+    }
+
+    [Fact]
+    public async Task EventRoutingProcessor_ScopesCorrectTenantContext_PerGroupInBatch()
+    {
+        var tenantA = await CreateTenantAsync(100);
+        await CreateRuleAsync(tenantA, "order.created", "slack");
+
+        var tenantB = await CreateTenantAsync(100);
+
+        await IngestEventAsync(tenantA, "order.created", new { });
+        await IngestEventAsync(tenantB, "order.created", new { });
+
+        var tenantBDeadLetters = await PollDeadLettersAsync(tenantB, expectedCount: 1, TimeSpan.FromSeconds(5));
+        Assert.Single(tenantBDeadLetters);
+
+        var response = await _client.GetAsync($"/api/dead-letters/tenant/{tenantA}");
+        var items = await response.Content.ReadFromJsonAsync<JsonElement[]>();
+        Assert.Empty(items!);
+    }
+
+    [Fact]
+    public async Task TenantA_ExhaustingRateLimit_DoesNotBlock_TenantB()
+    {
+        var tenantA = await CreateTenantAsync(rateLimitPerMinute: 1);
+        var tenantB = await CreateTenantAsync(rateLimitPerMinute: 100);
+
+        var first = await IngestEventAsync(tenantA, "ping", new { });
+        Assert.Equal(HttpStatusCode.Accepted, first.StatusCode);
+
+        var second = await IngestEventAsync(tenantA, "ping", new { });
+        Assert.Equal(HttpStatusCode.TooManyRequests, second.StatusCode);
+
+        var forB = await IngestEventAsync(tenantB, "ping", new { });
+        Assert.Equal(HttpStatusCode.Accepted, forB.StatusCode);
+    }
+
+    private async Task<Guid> CreateTenantAsync(int rateLimitPerMinute)
+    {
+        var response = await _client.PostAsJsonAsync("/api/tenants", new
+        {
+            name = $"Test-Tenant-{Guid.NewGuid():N}",
+            rateLimitPerMinute
+        });
+        response.EnsureSuccessStatusCode();
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        return body.GetProperty("id").GetGuid();
+    }
+
+    private async Task CreateRuleAsync(Guid tenantId, string eventType, string channelType)
+    {
+        var response = await _client.PostAsJsonAsync(
+            $"/api/tenants/{tenantId}/rules",
+            new { eventType, channelType });
+        response.EnsureSuccessStatusCode();
+    }
+
+    private Task<HttpResponseMessage> IngestEventAsync(Guid tenantId, string eventType, object payload) =>
+        _client.PostAsJsonAsync("/api/events", new
+        {
+            tenantId,
+            eventType,
+            payload = JsonSerializer.Serialize(payload)
+        });
+
+    private async Task<List<JsonElement>> PollDeadLettersAsync(
+        Guid tenantId, int expectedCount, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            var response = await _client.GetAsync($"/api/dead-letters/tenant/{tenantId}");
+            var items = await response.Content.ReadFromJsonAsync<JsonElement[]>();
+            if (items?.Length >= expectedCount)
+                return [.. items.Take(expectedCount)];
+            await Task.Delay(100);
+        }
+        return [];
+    }
+}
+
+public class PartialDispatchFailureTests : IClassFixture<PartialFailureWebApplicationFactory>
+{
+    private readonly HttpClient _client;
+    private readonly PartialFailureWebApplicationFactory _factory;
+
+    public PartialDispatchFailureTests(PartialFailureWebApplicationFactory factory)
+    {
+        _client = factory.CreateClient();
+        _factory = factory;
+    }
+
+    [Fact]
+    public async Task OneChannelFailure_DeadLettersOnlyFailedDispatch()
+    {
+        var (tenantId, messageId) = await IngestMultiChannelEventAsync();
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        JsonElement[]? deadLetters = null;
+        while (DateTime.UtcNow < deadline)
+        {
+            var response = await _client.GetAsync($"/api/dead-letters/tenant/{tenantId}");
+            deadLetters = await response.Content.ReadFromJsonAsync<JsonElement[]>();
+            if (deadLetters?.Length >= 1)
+                break;
+            await Task.Delay(100);
+        }
+
+        Assert.NotNull(deadLetters);
+        var channelFailure = Assert.Single(deadLetters!);
+        Assert.Equal("teams", channelFailure.GetProperty("channelType").GetString());
+        Assert.NotEqual(Guid.Empty, channelFailure.GetProperty("dispatchId").GetGuid());
+
+        var status = await GetParentMessageStatusAsync(tenantId, messageId);
+        Assert.Equal(MessageStatus.PartiallyDispatched, status);
+    }
+
+    private async Task<(Guid TenantId, Guid MessageId)> IngestMultiChannelEventAsync()
+    {
+        var tenantResponse = await _client.PostAsJsonAsync("/api/tenants", new
+        {
+            name = $"Partial-Fail-{Guid.NewGuid():N}",
+            rateLimitPerMinute = 100
+        });
+        tenantResponse.EnsureSuccessStatusCode();
+        var tenantId = (await tenantResponse.Content.ReadFromJsonAsync<JsonElement>())
+            .GetProperty("id").GetGuid();
+
+        await _client.PostAsJsonAsync($"/api/tenants/{tenantId}/rules",
+            new { eventType = "order.created", channelType = "slack" });
+        await _client.PostAsJsonAsync($"/api/tenants/{tenantId}/rules",
+            new { eventType = "order.created", channelType = "teams" });
+
+        var ingest = await _client.PostAsJsonAsync("/api/events", new
+        {
+            tenantId,
+            eventType = "order.created",
+            payload = JsonSerializer.Serialize(new { orderId = "x" })
+        });
+        Assert.Equal(HttpStatusCode.Accepted, ingest.StatusCode);
+        var messageId = (await ingest.Content.ReadFromJsonAsync<JsonElement>())
+            .GetProperty("messageId").GetGuid();
+
+        return (tenantId, messageId);
+    }
+
+    private async Task<MessageStatus> GetParentMessageStatusAsync(Guid tenantId, Guid messageId)
+    {
+        using var scope = _factory.Services.CreateScope();
+        var tenantContext = scope.ServiceProvider.GetRequiredService<ITenantContext>();
+        tenantContext.CurrentTenantId = tenantId;
+        var messageRepo = scope.ServiceProvider.GetRequiredService<IMessageRepository>();
+        var message = await messageRepo.GetByIdAsync(tenantId, messageId, CancellationToken.None);
+        Assert.NotNull(message);
+        return message!.Status;
+    }
+}
+
+public class AllDispatchFailureTests : IClassFixture<AllFailureWebApplicationFactory>
+{
+    private readonly HttpClient _client;
+    private readonly AllFailureWebApplicationFactory _factory;
+
+    public AllDispatchFailureTests(AllFailureWebApplicationFactory factory)
+    {
+        _client = factory.CreateClient();
+        _factory = factory;
+    }
+
+    [Fact]
+    public async Task AllChannelsFail_ParentMessageIsDeliveryFailed()
+    {
+        var tenantResponse = await _client.PostAsJsonAsync("/api/tenants", new
+        {
+            name = $"All-Fail-{Guid.NewGuid():N}",
+            rateLimitPerMinute = 100
+        });
+        tenantResponse.EnsureSuccessStatusCode();
+        var tenantId = (await tenantResponse.Content.ReadFromJsonAsync<JsonElement>())
+            .GetProperty("id").GetGuid();
+
+        await _client.PostAsJsonAsync($"/api/tenants/{tenantId}/rules",
+            new { eventType = "order.created", channelType = "slack" });
+        await _client.PostAsJsonAsync($"/api/tenants/{tenantId}/rules",
+            new { eventType = "order.created", channelType = "teams" });
+
+        var ingest = await _client.PostAsJsonAsync("/api/events", new
+        {
+            tenantId,
+            eventType = "order.created",
+            payload = JsonSerializer.Serialize(new { orderId = "x" })
+        });
+        Assert.Equal(HttpStatusCode.Accepted, ingest.StatusCode);
+        var messageId = (await ingest.Content.ReadFromJsonAsync<JsonElement>())
+            .GetProperty("messageId").GetGuid();
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (DateTime.UtcNow < deadline)
+        {
+            var response = await _client.GetAsync($"/api/dead-letters/tenant/{tenantId}");
+            var deadLetters = await response.Content.ReadFromJsonAsync<JsonElement[]>();
+            if (deadLetters?.Length >= 2)
+                break;
+            await Task.Delay(100);
+        }
+
+        using var scope = _factory.Services.CreateScope();
+        var tenantContext = scope.ServiceProvider.GetRequiredService<ITenantContext>();
+        tenantContext.CurrentTenantId = tenantId;
+        var messageRepo = scope.ServiceProvider.GetRequiredService<IMessageRepository>();
+        var message = await messageRepo.GetByIdAsync(tenantId, messageId, CancellationToken.None);
+
+        Assert.NotNull(message);
+        Assert.Equal(MessageStatus.DeliveryFailed, message!.Status);
+    }
+}
+
+public sealed class PartialFailureWebApplicationFactory : WebApplicationFactory<Program>
+{
+    private readonly string _dbPath =
+        Path.Combine(Path.GetTempPath(), $"mn-partial-{Guid.NewGuid():N}.db");
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.ConfigureAppConfiguration(config =>
+            config.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["ConnectionStrings:DefaultConnection"] = $"Data Source={_dbPath}"
+            }));
+
+        builder.ConfigureTestServices(services =>
+        {
+            services.RemoveAll<INotificationChannel>();
+            services.AddSingleton<INotificationChannel, SlackChannel>();
+            services.AddSingleton<INotificationChannel, FailingTeamsChannel>();
+        });
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        base.Dispose(disposing);
+        if (!disposing) return;
+        foreach (var suffix in new[] { "", "-shm", "-wal" })
+        {
+            var path = _dbPath + suffix;
+            if (File.Exists(path))
+                try { File.Delete(path); } catch { }
+        }
+    }
+}
+
+public sealed class AllFailureWebApplicationFactory : WebApplicationFactory<Program>
+{
+    private readonly string _dbPath =
+        Path.Combine(Path.GetTempPath(), $"mn-allfail-{Guid.NewGuid():N}.db");
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.ConfigureAppConfiguration(config =>
+            config.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["ConnectionStrings:DefaultConnection"] = $"Data Source={_dbPath}"
+            }));
+
+        builder.ConfigureTestServices(services =>
+        {
+            services.RemoveAll<INotificationChannel>();
+            services.AddSingleton<INotificationChannel, FailingSlackChannel>();
+            services.AddSingleton<INotificationChannel, FailingTeamsChannel>();
+        });
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        base.Dispose(disposing);
+        if (!disposing) return;
+        foreach (var suffix in new[] { "", "-shm", "-wal" })
+        {
+            var path = _dbPath + suffix;
+            if (File.Exists(path))
+                try { File.Delete(path); } catch { }
+        }
+    }
+}
+
+internal sealed class FailingSlackChannel : INotificationChannel
+{
+    public string ChannelType => ChannelTypes.Slack;
+
+    public Task SendAsync(DispatchMessage dispatch, RoutingRule rule, CancellationToken ct) =>
+        throw new InvalidOperationException("Simulated Slack channel failure.");
+}
+
+internal sealed class FailingTeamsChannel : INotificationChannel
+{
+    public string ChannelType => ChannelTypes.Teams;
+
+    public Task SendAsync(DispatchMessage dispatch, RoutingRule rule, CancellationToken ct) =>
+        throw new InvalidOperationException("Simulated Teams channel failure.");
+}
+
+// ============================================================
+// MN.Tests\UnscopedTenantQueryInterceptorTests.cs
+// ============================================================
+using Microsoft.EntityFrameworkCore;
+using MN.DAL;
+using MN.Interfaces;
+
+namespace MN.Tests;
+
+public class UnscopedTenantQueryInterceptorTests : IDisposable
+{
+    private readonly AppDbContext _db;
+
+    public UnscopedTenantQueryInterceptorTests()
+    {
+        TenantFilteredEntityRegistry.ResetCacheForTesting();
+
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite("Data Source=:memory:")
+            .Options;
+
+        _db = new AppDbContext(options, new TenantContext());
+        _db.Database.OpenConnection();
+        _db.Database.EnsureCreated();
+    }
+
+    public void Dispose()
+    {
+        _db.Dispose();
+        TenantFilteredEntityRegistry.ResetCacheForTesting();
+    }
+
+    [Fact]
+    public void GetMatches_DiscoversAllEntitiesWithQueryFilters()
+    {
+        var matches = TenantFilteredEntityRegistry.GetMatches(_db.Model);
+
+        Assert.Equal(3, matches.Count);
+        Assert.Contains(matches, m => m.TableName == "RoutingRules");
+        Assert.Contains(matches, m => m.TableName == "Messages");
+        Assert.Contains(matches, m => m.TableName == "Dispatches");
+    }
+
+    [Theory]
+    [InlineData(@"SELECT ""r"".""Id"" FROM ""RoutingRules"" AS ""r"" WHERE ""r"".""TenantId"" = @p0")]
+    [InlineData(@"SELECT * FROM [RoutingRules] AS r WHERE r.TenantId = @p0")]
+    [InlineData(@"SELECT * FROM RoutingRules WHERE TenantId = @p0")]
+    public void IdentifierPattern_MatchesTableReference_WithAliasAndProviderQuoting(string sql)
+    {
+        var pattern = TenantFilteredEntityRegistry.BuildIdentifierPattern("RoutingRules");
+
+        Assert.Matches(pattern, sql);
+    }
+
+    [Fact]
+    public void IdentifierPattern_DoesNotMatchTableNameInsideComment()
+    {
+        var pattern = TenantFilteredEntityRegistry.BuildIdentifierPattern("RoutingRules");
+        var sql = TenantFilteredEntityRegistry.StripSqlComments(
+            @"SELECT 1 -- RoutingRules should not match in a line comment");
+
+        Assert.DoesNotMatch(pattern, sql);
+    }
+
+    [Fact]
+    public void IdentifierPattern_DoesNotMatchTableNameAsSubstringOfAnotherIdentifier()
+    {
+        var pattern = TenantFilteredEntityRegistry.BuildIdentifierPattern("Messages");
+
+        Assert.DoesNotMatch(pattern, "SELECT * FROM NotificationMessages");
+    }
+
+    [Fact]
+    public void GetMatches_DetectsUnscopedQueryAgainstFilteredTable()
+    {
+        var sql = TenantFilteredEntityRegistry.StripSqlComments(
+            @"SELECT ""r"".""Id"" FROM ""RoutingRules"" AS ""r""");
+
+        var matched = TenantFilteredEntityRegistry.GetMatches(_db.Model)
+            .Any(m => m.Pattern.IsMatch(sql));
+
+        Assert.True(matched);
+    }
+}
+
+// ============================================================
+// morrow-notifications\Controllers\DeadLettersController.cs
+// ============================================================
+using Microsoft.AspNetCore.Mvc;
+using MN.Interfaces;
+using MN.Models;
+
+namespace morrow_notifications.Controllers;
+
+[ApiController]
+[Route("api/dead-letters")]
+public class DeadLettersController(IDeadLetterQueue deadLetterQueue) : ControllerBase
+{
+    // Intentionally un-scoped: admin/debugging surface for inspecting all dead letters
+    // regardless of tenant. No auth is in scope for this project.
+    [HttpGet]
+    public IActionResult GetAll() =>
+        Ok(deadLetterQueue.GetAll().Select(ToResponse));
+
+    [HttpGet("tenant/{tenantId:guid}")]
+    public IActionResult GetByTenant(Guid tenantId) =>
+        Ok(deadLetterQueue.GetByTenant(tenantId).Select(ToResponse));
+
+    private static DeadLetterResponse ToResponse(MN.Models.DeadLetterMessage d) =>
+        new(d.Id, d.TenantId, d.OriginalMessageId, d.DispatchId, d.ChannelType, d.EventType, d.Payload, d.FailureReason, d.FailedAt);
+}
+
+// ============================================================
+// morrow-notifications\Controllers\EventsController.cs
+// ============================================================
+using Microsoft.AspNetCore.Mvc;
+using MN.BusinessLogic;
+using MN.Core;
+using MN.Interfaces;
+using MN.Models;
+
+namespace morrow_notifications.Controllers;
+
+[ApiController]
+[Route("api/events")]
+public class EventsController(IIngestionService ingestionService) : ControllerBase
+{
+    [HttpPost]
+    public async Task<IActionResult> Ingest([FromBody] IngestEventRequest request, CancellationToken ct)
+    {
+        if (request.TenantId == Guid.Empty)
+            return BadRequest(new { error = "TenantId is required." });
+
+        if (string.IsNullOrWhiteSpace(request.EventType))
+            return BadRequest(new { error = "EventType is required." });
+
+        if (string.IsNullOrWhiteSpace(request.Payload))
+            return BadRequest(new { error = "Payload is required." });
+
+        if (request.Payload.Length > NotificationLimits.MaxPayloadLength)
+            return BadRequest(new { error = $"Payload exceeds maximum length of {NotificationLimits.MaxPayloadLength} characters." });
+
+        try
+        {
+            // -> IngestionService
+            var result = await ingestionService.IngestAsync(request, ct);
+            return Accepted(result);
+        }
+        catch (RateLimitExceededException ex)
+        {
+            return StatusCode(429, new { error = ex.Message });
+        }
+        catch (KeyNotFoundException ex)
+        {
+            return NotFound(new { error = ex.Message });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return UnprocessableEntity(new { error = ex.Message });
+        }
+    }
+}
+
+// ============================================================
+// morrow-notifications\Controllers\RoutingRulesController.cs
+// ============================================================
+using Microsoft.AspNetCore.Mvc;
+using MN.Entities;
+using MN.Interfaces;
+using MN.Models;
+
+namespace morrow_notifications.Controllers;
+
+[ApiController]
+[Route("api/tenants/{tenantId:guid}/rules")]
+public class RoutingRulesController(
+    ITenantRepository tenantRepository,
+    IRoutingRuleRepository ruleRepository,
+    ITenantContext tenantContext,
+    IEnumerable<INotificationChannel> channels) : ControllerBase
+{
+    // Valid channel types are derived from registered INotificationChannel implementations.
+    // Adding a new channel class is the only change needed â€” no edits here.
+    private readonly HashSet<string> _validChannelTypes =
+        new(channels.Select(c => c.ChannelType), StringComparer.OrdinalIgnoreCase);
+        
+    [HttpGet]
+    public async Task<IActionResult> GetAll(Guid tenantId, CancellationToken ct)
+    {
+        tenantContext.CurrentTenantId = tenantId;
+        if (!await tenantRepository.ExistsAsync(tenantId, ct)) return NotFound(new { error = "Tenant not found." });
+        var rules = await ruleRepository.GetByTenantAsync(tenantId, ct);
+        return Ok(rules.Select(ToResponse));
+    }
+
+    [HttpGet("{ruleId:guid}")]
+    public async Task<IActionResult> GetById(Guid tenantId, Guid ruleId, CancellationToken ct)
+    {
+        tenantContext.CurrentTenantId = tenantId;
+        if (!await tenantRepository.ExistsAsync(tenantId, ct)) return NotFound(new { error = "Tenant not found." });
+        var rule = await ruleRepository.GetByIdAsync(tenantId, ruleId, ct);
+        return rule is null ? NotFound() : Ok(ToResponse(rule));
+    }
+
+    [HttpPost]
+    public async Task<IActionResult> Create(Guid tenantId, [FromBody] CreateRoutingRuleRequest request, CancellationToken ct)
+    {
+        tenantContext.CurrentTenantId = tenantId;
+        if (!await tenantRepository.ExistsAsync(tenantId, ct)) return NotFound(new { error = "Tenant not found." });
+
+        if (string.IsNullOrWhiteSpace(request.EventType))
+            return BadRequest(new { error = "EventType is required." });
+
+        if (string.IsNullOrWhiteSpace(request.ChannelType))
+            return BadRequest(new { error = "ChannelType is required." });
+
+        if (!_validChannelTypes.Contains(request.ChannelType))
+            return BadRequest(new { error = $"ChannelType must be one of: {string.Join(", ", _validChannelTypes)}." });
+
+        var eventType = request.EventType.Trim();
+        var channelType = request.ChannelType.ToLowerInvariant();
+        if (await ruleRepository.GetByEventTypeAndChannelAsync(tenantId, eventType, channelType, ct) is not null)
+        {
+            return Conflict(new
+            {
+                error = $"A routing rule for event type '{eventType}' and channel '{channelType}' already exists for this tenant."
+            });
+        }
+
+        var rule = new RoutingRule
+        {
+            Id = Guid.NewGuid(),
+            TenantId = tenantId,
+            EventType = eventType,
+            ChannelType = channelType,
+            IsActive = true,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        var created = await ruleRepository.CreateAsync(rule, ct);
+        return CreatedAtAction(nameof(GetById), new { tenantId, ruleId = created.Id }, ToResponse(created));
+    }
+
+    [HttpPatch("{ruleId:guid}")]
+    public async Task<IActionResult> Update(Guid tenantId, Guid ruleId, [FromBody] UpdateRoutingRuleRequest request, CancellationToken ct)
+    {
+        tenantContext.CurrentTenantId = tenantId;
+        if (!await tenantRepository.ExistsAsync(tenantId, ct)) return NotFound(new { error = "Tenant not found." });
+
+        var rule = await ruleRepository.GetByIdAsync(tenantId, ruleId, ct);
+        if (rule is null) return NotFound();
+
+        if (request.ChannelType is not null && !_validChannelTypes.Contains(request.ChannelType))
+            return BadRequest(new { error = $"ChannelType must be one of: {string.Join(", ", _validChannelTypes)}." });
+
+        var eventType = request.EventType?.Trim() ?? rule.EventType;
+        var channelType = request.ChannelType?.ToLowerInvariant() ?? rule.ChannelType;
+
+        if (request.EventType is not null || request.ChannelType is not null)
+        {
+            var existing = await ruleRepository.GetByEventTypeAndChannelAsync(tenantId, eventType, channelType, ct);
+            if (existing is not null && existing.Id != ruleId)
+            {
+                return Conflict(new
+                {
+                    error = $"A routing rule for event type '{eventType}' and channel '{channelType}' already exists for this tenant."
+                });
+            }
+        }
+
+        if (request.EventType is not null) rule.EventType = eventType;
+        if (request.ChannelType is not null) rule.ChannelType = channelType;
+        if (request.IsActive is not null) rule.IsActive = request.IsActive.Value;
+
+        var updated = await ruleRepository.UpdateAsync(rule, ct);
+        return Ok(ToResponse(updated));
+    }
+
+    [HttpDelete("{ruleId:guid}")]
+    public async Task<IActionResult> Delete(Guid tenantId, Guid ruleId, CancellationToken ct)
+    {
+        tenantContext.CurrentTenantId = tenantId;
+        if (!await tenantRepository.ExistsAsync(tenantId, ct)) return NotFound(new { error = "Tenant not found." });
+        var rule = await ruleRepository.GetByIdAsync(tenantId, ruleId, ct);
+        if (rule is null) return NotFound();
+
+        await ruleRepository.DeleteAsync(tenantId, ruleId, ct);
+        return NoContent();
+    }
+
+    private static RoutingRuleResponse ToResponse(RoutingRule r) =>
+        new(r.Id, r.TenantId, r.EventType, r.ChannelType, r.IsActive, r.CreatedAt);
+}
+
+// ============================================================
+// morrow-notifications\Controllers\TenantsController.cs
+// ============================================================
+using Microsoft.AspNetCore.Mvc;
+using MN.Entities;
+using MN.Interfaces;
+using MN.Models;
+
+namespace morrow_notifications.Controllers;
+
+[ApiController]
+[Route("api/tenants")]
+public class TenantsController(
+    ITenantRepository tenantRepository,
+    IRateLimiterService rateLimiterService) : ControllerBase
+{
+    [HttpGet]
+    public async Task<IActionResult> GetAll(CancellationToken ct)
+    {
+        var tenants = await tenantRepository.GetAllAsync(ct);
+        return Ok(tenants.Select(ToResponse));
+    }
+
+    [HttpGet("{id:guid}")]
+    public async Task<IActionResult> GetById(Guid id, CancellationToken ct)
+    {
+        var tenant = await tenantRepository.GetByIdAsync(id, ct);
+        return tenant is null ? NotFound() : Ok(ToResponse(tenant));
+    }
+
+    [HttpPost]
+    public async Task<IActionResult> Create([FromBody] CreateTenantRequest request, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(request.Name))
+            return BadRequest(new { error = "Name is required." });
+
+        if (request.RateLimitPerMinute <= 0)
+            return BadRequest(new { error = "RateLimitPerMinute must be > 0." });
+
+        var name = request.Name.Trim();
+        var existing = await tenantRepository.GetByNameAsync(name, ct);
+        if (existing is not null)
+            return Conflict(new { error = $"A tenant named '{existing.Name}' already exists.", id = existing.Id });
+
+        var tenant = new Tenant
+        {
+            Id = Guid.NewGuid(),
+            Name = name,
+            RateLimitPerMinute = request.RateLimitPerMinute,
+            IsActive = true,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        var created = await tenantRepository.CreateAsync(tenant, ct);
+        rateLimiterService.ConfigureTenant(created.Id, created.RateLimitPerMinute);
+
+        return CreatedAtAction(nameof(GetById), new { id = created.Id }, ToResponse(created));
+    }
+
+    [HttpPatch("{id:guid}")]
+    public async Task<IActionResult> Update(Guid id, [FromBody] UpdateTenantRequest request, CancellationToken ct)
+    {
+        var tenant = await tenantRepository.GetByIdAsync(id, ct);
+        if (tenant is null) return NotFound();
+
+        if (request.Name is not null) tenant.Name = request.Name.Trim();
+        if (request.IsActive is not null) tenant.IsActive = request.IsActive.Value;
+        if (request.RateLimitPerMinute is not null)
+        {
+            if (request.RateLimitPerMinute <= 0)
+                return BadRequest(new { error = "RateLimitPerMinute must be > 0." });
+            tenant.RateLimitPerMinute = request.RateLimitPerMinute.Value;
+        }
+
+        var updated = await tenantRepository.UpdateAsync(tenant, ct);
+
+        // Keep limiter state in sync: reconfigure on active, remove on deactivate
+        if (updated.IsActive)
+            rateLimiterService.ConfigureTenant(updated.Id, updated.RateLimitPerMinute);
+        else
+            rateLimiterService.RemoveTenant(updated.Id);
+
+        return Ok(ToResponse(updated));
+    }
+
+    [HttpDelete("{id:guid}")]
+    public async Task<IActionResult> Delete(Guid id, CancellationToken ct)
+    {
+        var tenant = await tenantRepository.GetByIdAsync(id, ct);
+        if (tenant is null) return NotFound();
+
+        await tenantRepository.DeleteAsync(id, ct);
+        rateLimiterService.RemoveTenant(id);
+        return NoContent();
+    }
+
+    private static TenantResponse ToResponse(Tenant t) =>
+        new(t.Id, t.Name, t.IsActive, t.RateLimitPerMinute, t.CreatedAt);
+}
+
+// ============================================================
+// morrow-notifications\Program.cs
+// ============================================================
+using Microsoft.EntityFrameworkCore;
+using MN.BusinessLogic;
+using MN.DAL;
+using MN.Interfaces;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddControllers();
+builder.Services.AddOpenApi();
+builder.Services.AddHttpClient();
+
+builder.Services.AddScoped<ITenantContext, TenantContext>();
+builder.Services.AddScoped<TenantSessionContextInterceptor>();
+builder.Services.AddScoped<UnscopedTenantQueryInterceptor>();
+
+builder.Services.AddDbContext<AppDbContext>((sp, options) =>
+    options.UseSqlite(builder.Configuration.GetConnectionString("DefaultConnection")
+        ?? "Data Source=morrow-notifications.db")
+           .AddInterceptors(
+               sp.GetRequiredService<TenantSessionContextInterceptor>(),
+               sp.GetRequiredService<UnscopedTenantQueryInterceptor>()));
+
+builder.Services.AddScoped<ITenantRepository, TenantRepository>();
+builder.Services.AddScoped<IRoutingRuleRepository, RoutingRuleRepository>();
+builder.Services.AddScoped<IMessageRepository, MessageRepository>();
+builder.Services.AddScoped<IDispatchRepository, DispatchRepository>();
+builder.Services.AddScoped<IDispatchOutboxRepository, DispatchOutboxRepository>();
+
+builder.Services.AddSingleton<IEventQueue, InMemoryEventQueue>();
+builder.Services.AddSingleton<IDispatchQueue, InMemoryDispatchQueue>();
+builder.Services.AddSingleton<IDeadLetterQueue, InMemoryDeadLetterQueue>();
+
+builder.Services.AddSingleton<IRateLimiterService, RateLimiterService>();
+
+builder.Services.AddScoped<IIngestionService, IngestionService>();
+
+builder.Services.AddSingleton<INotificationChannel, SlackChannel>();
+builder.Services.AddSingleton<INotificationChannel, TeamsChannel>();
+
+builder.Services.AddSingleton<IMessageDispatcher, MessageDispatcher>();
+
+builder.Services.AddHostedService<EventRoutingProcessorService>();
+builder.Services.AddHostedService<DispatchOutboxPublisherService>();
+builder.Services.AddHostedService<DeliveryProcessorService>();
+
+var app = builder.Build();
+
+// when moving to redis, would remove this, move to lazy loading pattern
+// and delete this block.  i.e., try the cache, if it's missing, read rate
+// limit from db, write result to the cache, move on.  probably do per-instance
+// semaphore on the DB check so you don't cache stampede.  if you have a lot
+// of pods you'd want a distributed way of doing this
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    db.Database.EnsureCreated();
+
+    var rateLimiter = app.Services.GetRequiredService<IRateLimiterService>();
+    var tenants = db.Tenants.Where(t => t.IsActive).ToList();
+    foreach (var tenant in tenants)
+        rateLimiter.ConfigureTenant(tenant.Id, tenant.RateLimitPerMinute);
+}
+
+if (app.Environment.IsDevelopment())
+    app.MapOpenApi();
+
+app.UseHttpsRedirection();
+app.MapControllers();
+app.Run();
+
+public partial class Program { }
+
+// ============================================================
+// README.md
+// ============================================================
+# morrow-notifications
+
+Multi-tenant notification platform â€” ingest events, apply per-tenant routing rules, dispatch to Slack/Teams (stub channels).
+
+## For reviewers (start here)
+
+**Prerequisites:** [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) only. No Docker, no external services.
+
+**One command â€” build, unit tests, start API, full API smoke suite, stop API:**
+
+```powershell
+./verify.ps1
+```
+
+Mac/Linux:
+
+```bash
+chmod +x verify.sh && ./verify.sh
+```
+
+Expected output ends with `ALL CHECKS PASSED`. The PowerShell path runs **20 unit tests** plus **51 API checks**; the bash script runs the same unit tests plus a shorter curl smoke path.
+
+**Manual path** (if you prefer):
+
+```bash
+dotnet test MN.Tests/MN.Tests.csproj
+dotnet run --project morrow-notifications/morrow-notifications.csproj
+```
+
+Then either:
+
+- `./run-e2e-tests.ps1` â€” full API smoke suite (PowerShell), or
+- Open `morrow-notifications/morrow-notifications.core-loop.http` in VS Code ([REST Client](https://marketplace.visualstudio.com/items?itemName=humao.rest-client)) or Visual Studio and run all three requests top-to-bottom (no copy/paste â€” IDs chain automatically).
+
+API base URL: `http://localhost:5252`
+
+---
+
+## Run
+
+```bash
+dotnet run --project morrow-notifications/morrow-notifications.csproj
+```
+
+SQLite database (`morrow-notifications.db`) is created automatically on first run.
+
+---
+
+## Exercising the API
+
+| File | Purpose |
+|---|---|
+| `morrow-notifications.core-loop.http` | **Start here** â€” self-contained happy path (tenant â†’ rule â†’ ingest). |
+| `morrow-notifications.tenants.http` | Full tenant CRUD including activate/deactivate. |
+| `morrow-notifications.rules.http` | Full routing rule CRUD; multi-channel fan-out example. |
+| `morrow-notifications.events.http` | Ingest: matched, unrouted (â†’ dead-letter), unknown tenant. |
+| `morrow-notifications.dead-letters.http` | Read dead-lettered messages. |
+
+Files other than `core-loop.http` use `@tenantId` / `@ruleId` placeholders at the top â€” paste IDs from earlier responses, or use `run-e2e-tests.ps1` / `verify.ps1` for automated coverage.
+
+---
+
+## Architecture
+
+See [DESIGN.md](DESIGN.md). Non-obvious trade-offs are also captured in [docs/adrs/](docs/adrs/README.md).
+
+---
+
+## Running the Tests
+
+```bash
+dotnet test MN.Tests/MN.Tests.csproj
+```
+
+In-process tests (via `WebApplicationFactory`) verify:
+
+- Tenant B cannot read Tenant A's routing rules
+- Tenant B's events are not dispatched by Tenant A's rules
+- Tenant A exhausting its rate limit does not block Tenant B
+- Partial channel failure dead-letters only the failed dispatch
+- Outbox lease claiming under concurrent publishers
+
+---
+
+## Known Limitations and What I'd Do Differently
+
+See [DESIGN.md](DESIGN.md).
+
+---
+
+## AI Tools
+
+Built with **GitHub Copilot** (Claude Sonnet 4.6) throughout â€” architecture, scaffolding, implementation, and tests. All code was reviewed and iterated on interactively.
+
+Double-checked and polished with Gemini's 3.5 Thinking model (using `concat-source.ps1`) along with Cursor AI.
+
+// ============================================================
+// DESIGN.md
+// ============================================================
+# Design
+
+## Philosophy
+
+In-process on SQLite â€” runnable in under a minute, not a production topology.
+
+---
+
+## Data Model
+
+| Entity | Purpose |
+|---|---|
+| `Tenant` | Root aggregate. `RateLimitPerMinute`, `IsActive`. |
+| `RoutingRule` | `EventType â†’ ChannelType`. Unique `(TenantId, EventType, ChannelType)`. |
+| `NotificationMessage` | Event audit trail: `Processing â†’ FanOutComplete â†’ Dispatched / PartiallyDispatched / DeliveryFailed / DeadLettered`. Upserted by message Id on each attempt. |
+| `NotificationDispatch` | Per-channel dispatch record keyed by deterministic `(OriginalMessageId, RuleId)`. Tracks `Pending â†’ Succeeded / Failed`. |
+| `DispatchOutboxEntry` | Transactional outbox: dispatch payload written in the same commit as `NotificationDispatch`; `PublishedAt` null until enqueued. |
+| `DeadLetterMessage` | In-memory DTO only (`ConcurrentBag`), not persisted. Event-level or dispatch-level entries. |
+
+Queue payloads (`ProcessingMessage`, `DispatchMessage`) live in `MN.Models` and are not persisted directly.
+
+---
+
+## Tenant Isolation
+
+Four layers, fail-closed by default:
+
+1. **Repositories** â€” every query takes explicit `tenantId`.
+2. **EF global query filter** â€” bound to scoped `ITenantContext`; no context â†’ empty results.
+3. **`SaveChanges` mutation guard** â€” force-stamps `TenantId` on writes from context, not request body.
+4. **`TenantSessionContextInterceptor` stub** â€” no-op on SQLite; would call `sp_set_session_context` for Azure SQL RLS.
+
+Each processor sets `CurrentTenantId` per tenant group via a fresh DI scope. Admin cross-tenant reads set `IsAdminScope = true`.
+
+Schema-per-tenant would force every migration, rule lookup, and message write to be schema-aware and provisioned per onboarded tenant; unnecessary complexity for a shared notification router serving many small tenants.
+
+---
+
+## Rate Limiting
+
+`SlidingWindowRateLimiter` per tenant (60s window, 6 segments). Exceeded â†’ 429 at ingest; on delivery, requeue with a 3s visibility delay (stand-in for ASB scheduled redelivery). In-process singleton â€” APIM or Redis at scale.
+
+Rate limiting applies at **ingest** (reject before enqueue) and **delivery** (defer dispatch item retry when the window is full â€” does not consume delivery attempts).
+
+---
+
+## Pipeline
+
+```
+POST /api/events
+  â†’ IngestionService                rate limit â†’ tenant check â†’ enqueue event
+  â†’ Event queue                     IEventQueue (peek-lock)
+  â†’ EventRoutingProcessorService    record event, match rules, write dispatch + outbox rows
+  â†’ DispatchOutboxPublisherService  publish outbox â†’ dispatch queue
+  â†’ Dispatch queue                  IDispatchQueue (peek-lock)
+  â†’ DeliveryProcessorService        rate limit â†’ send â†’ retry/DLQ per channel
+  â†’ Slack / Teams                   stubs
+```
+
+**Ingestion** â€” rate limit before DB; keeps the invariant on any future ingest path.
+
+**Event routing** â€” peek-lock batch locally; `EnsureProcessingAsync` upserts by event Id; up to 3 queue-level retries on transient failure, immediate DLQ on permanent failure (no rules, inactive tenant). `PrepareDispatchesForRoutingAsync` writes `NotificationDispatch` + `DispatchOutboxEntry` in one commit (no direct queue access). Dispatch Id is deterministic from `(OriginalMessageId, RuleId)` so event redelivery does not duplicate succeeded channels. Orphan recovery: `Pending` dispatch with no outbox row gets an outbox entry on redelivery.
+
+**Outbox publish** â€” background worker claims unpublished rows (lease per instance), enqueues to the dispatch queue, marks `PublishedAt`. Crash after enqueue but before mark can duplicate queue items; delivery worker skips dispatches already `Succeeded`.
+
+**Delivery** â€” one send per dispatch item; 3s timeout, 2 inline retries; any failure â†’ dispatch-level DLQ (other channels for the same event are unaffected). Rate-limited items are abandoned with a 3s visibility delay so the worker does not hot-loop. Parent event status aggregates when all dispatches reach a terminal state: all succeeded â†’ `Dispatched`; mixed â†’ `PartiallyDispatched`; all failed â†’ `DeliveryFailed`.
+
+**Production queues** â€” `IEventQueue` and `IDispatchQueue` model peek-lock (complete / abandon). Enqueue swaps cleanly; consumers would move to separate `ServiceBusSessionProcessor` instances with `SessionId = TenantId`.
+
+---
+
+## Known limitations / what I'd do with more time
+
+- **Queue / DLQ** â€” in-memory, lost on crash; visibility delay on abandon is a coarse timer, not lock-expiry simulation.
+- **Rate limiter** â€” in-process, no scale-out; Redis or APIM when multiple instances.
+- **Config reads** â€” fine to hammer the DB at this scale; under load, snapshot rule config into dispatch payloads and/or cache tenant+rules in Redis (outbox/dispatch state stays relational).
+- **Processing** â€” sequential tenant groups (SQLite); `Task.WhenAll` + ASB sessions in production.
+- **Channels** â€” no webhook config store; stubs only. Also needs hard timeouts on HTTP calls.
+- **Rules** â€” exact `EventType` match only.
+- **Idempotency** â€” no outbound dedupe; crash between send and complete can still duplicate on ASB redelivery.
+- **Admin** â€” RLS bypass plus admin query wonkiness demands separate admin app.
+
+// ============================================================
+// docs\adrs\001-transactional-outbox-for-dispatch-publish.md
+// ============================================================
+# ADR 001: Transactional outbox for dispatch publish
+
+**Scope:** `EventRoutingProcessorService`, `PrepareDispatchesForRoutingAsync`, `DispatchOutboxPublisherService`
+
+## The problem
+
+When routing an event, two things need to happen:
+
+1. Write a `NotificationDispatch` row to the DB — the durable record that tracks lifecycle state.
+2. Put a `DispatchMessage` on the dispatch queue — so `DeliveryProcessorService` knows to send it.
+
+These are two different systems. They cannot share a transaction. A crash between them leaves the system in an inconsistent state:
+
+| Crash point | Result |
+|-------------|--------|
+| After DB write, before enqueue | `Pending` dispatch row that will never be delivered. Nothing retries it — silent failure. |
+| After enqueue, before DB write | Queue message pointing at a dispatch record that doesn't exist yet. |
+
+The naive "write DB then enqueue" approach produces **orphan dispatches** — `Pending` rows that sit forever with no delivery worker aware of them.
+
+## Decision
+
+**Collapse the problem back to one system — the database.**
+
+Routing writes `NotificationDispatch` + `DispatchOutboxEntry` in a **single DB transaction**. That commit either happens or it doesn't. The queue is not touched during routing at all.
+
+A separate background worker (`DispatchOutboxPublisherService`) polls for unpublished outbox rows and enqueues them to the dispatch queue. If the publisher crashes mid-batch, the rows are simply re-drained on the next pass — no orphans, because intent is durably recorded in the DB before anything is enqueued.
+
+Dispatch Id is deterministic from `(OriginalMessageId, RuleId)` so if the event is redelivered and routing runs again, dispatches that already `Succeeded` are skipped. See [ADR 008](008-deterministic-dispatch-ids.md).
+
+## The trade-off accepted
+
+The outbox does not eliminate duplicates — it **moves** them. The publisher claims rows, enqueues, then marks `PublishedAt`. If it crashes after enqueue but before the mark, the row looks unpublished and gets re-enqueued on the next pass — a duplicate on the dispatch queue.
+
+This is tolerated deliberately. We already had to accept at-least-once delivery from the queue layer (ASB redelivers on lock expiry). Handling a duplicate dispatch message is the same problem: the delivery worker checks if the dispatch is already `Succeeded` before calling the channel, and skips if so. See [ADR 002](002-at-least-once-delivery.md).
+
+The ordering guarantee that prevents the reverse case: `MarkPublishedAsync` is called only after the entire tenant group is enqueued — so we never mark a row published without having enqueued it first.
+
+## Why the claiming mechanism (`ClaimedUntil` / `ClaimedBy`)
+
+Once the publisher can scale horizontally, two instances polling at the same time would both see the same unpublished rows and both enqueue them — amplifying duplicates before any crash happens.
+
+The claim is a distributed lease implemented in the DB, the same concept as a queue peek-lock:
+
+1. `TryClaimUnpublishedAcrossTenantsAsync` atomically sets `ClaimedUntil` (30s) and `ClaimedBy` (instance id) on a batch of rows via a single `ExecuteUpdateAsync`.
+2. Only the claiming instance can call `MarkPublishedAsync` — it requires a matching `ClaimedBy`.
+3. On success, `PublishedAt` is set and the lease fields are cleared.
+4. If the publisher crashes mid-batch, the lease expires and another instance reclaims the rows.
+
+This is separate from the transactional outbox *write* at routing time — that addresses atomicity. The claim addresses **concurrent publisher instances** at the drain step.
+
+## Orphan recovery
+
+If a `Pending` dispatch exists but its outbox row is missing (a partial commit edge case), routing retry detects the gap and inserts the missing outbox entry. This is a defensive recovery path, not the normal flow.
+
+## Consequences
+
+- **Pros:** No orphan `Pending` dispatches from routing; intent is durable before delivery is attempted; publisher scales horizontally without coordination beyond the claim lease.
+- **Cons:** At-least-once on the dispatch queue; delivery must tolerate duplicates (it does).
+- **Production:** Same pattern with ASB; the outbox table remains the source of truth for publish intent regardless of broker.
+
+// ============================================================
+// docs\adrs\002-at-least-once-delivery.md
+// ============================================================
+# ADR 002: At-least-once delivery (prefer duplicate over lost send)
+
+**Scope:** `DeliveryProcessorService`, `MessageDispatcher`, channel stubs
+
+## Context
+
+The pipeline is **at-least-once** end-to-end: events and dispatches can be redelivered from queues after crashes, abandons, or lock expiry.
+
+Two duplicate scenarios matter at delivery:
+
+### A. Outbox republish (handled)
+
+Publisher enqueued but crashed before `PublishedAt`. Same dispatch lands on the queue twice. **Mitigation:** if DB status is already `Succeeded`, complete the queue item without calling the channel.
+
+### B. Post-send, pre-commit (accepted gap)
+
+```
+Channel send succeeds (HTTP 200)
+  â†’ crash before UpdateStatusAsync(Succeeded)
+  â†’ queue redelivers
+  â†’ dispatch still Pending
+  â†’ send again â†’ duplicate notification
+```
+
+Skip-if-`Succeeded` does **not** help hereâ€”the first send never reached the DB.
+
+## Decision
+
+**Tolerate a rare duplicate notification rather than optimize for exactly-once outbound delivery.**
+
+We do not implement a full exactly-once pipeline (distributed transactions with Slack/Teams, two-phase outbound outbox, etc.) at this scope.
+
+## Slack / Teams deduping
+
+**Do not assume channels dedupe for us.**
+
+| Channel | Automatic dedup? |
+|---------|------------------|
+| Slack incoming webhooks | No â€” each POST is a new message. |
+| Teams incoming webhooks | No â€” each POST is a new message. |
+| Slack `chat.postMessage` | **Opt-in** â€” `client_msg_id` dedupes within ~30 minutes if we pass the same id. |
+
+If duplicates became a product problem in production, we would add an **explicit idempotency key** (e.g. `dispatchId`) on outbound callsâ€”not try to make the entire pipeline exactly-once.
+
+## High-compliance channels (not implemented)
+
+For channels where duplicates are unacceptable (financial alerts, legal/compliance SMS), we would **not** try to make the whole pipeline exactly-once across our DB and a third-party APIâ€”that requires cooperation from the provider. The goal is **at-most-once visible delivery** with **at-least-once internal retries**.
+
+Typical approach for those channels only:
+
+1. **Provider idempotency** â€” pass deterministic `dispatch.Id` ([ADR 008](008-deterministic-dispatch-ids.md)) on every outbound call so a retry after crash returns the original send instead of delivering twice.
+2. **Send ledger** â€” extend dispatch status with a claim-before-send step (`Sending` + lease, similar to outbox claiming). Persist provider acknowledgment (`providerMessageId`) before completing the queue item. Redelivery skips or reconciles when status is already `Accepted`/`Succeeded`.
+3. **Channel selection** â€” use vendors that document idempotency-key behavior; flag routing rules or channel types that require the stricter path.
+
+Slack/Teams stubs stay on the tolerant at-least-once path above; high-stakes adapters get the ledger + idempotency contract.
+
+## Consequences
+
+- **Pros:** Simpler delivery path; favors â€œnotification deliveredâ€ over â€œnever duplicate.â€
+- **Cons:** Narrow crash window can still double-send; concurrent redelivery while `Pending` can also double-send (no distributed lock).
+- **Acceptable because:** Duplicate Slack/Teams message is annoying, not financial loss; window is small (post-send to DB commit).
+
+// ============================================================
+// docs\adrs\003-dispatch-retry-layers-and-failed-status.md
+// ============================================================
+# ADR 003: Dispatch retry layers and `Failed` status semantics
+
+**Scope:** `DeliveryProcessorService`, `MessageDispatcher`, `PrepareDispatchesForRoutingAsync`
+
+## Context
+
+Retries exist at multiple layers. It is easy to confuse them when reading the code.
+
+## Three separate mechanisms
+
+| Layer | Where | Counter | Max | Terminal state |
+|-------|--------|---------|-----|----------------|
+| **Event routing** | `EventRoutingProcessorService` / event queue | `ProcessingMessage.DeliveryAttempts` | 3 | Event dead-lettered |
+| **Dispatch queue** | `DeliveryProcessorService` / dispatch queue | `DispatchMessage.DeliveryAttempts` | 3 | `DispatchStatus.Failed` + DLQ |
+| **Channel inline** | `MessageDispatcher` | (loop, not persisted) | 2 | Throws â†’ queue retry |
+
+**Worst case sends per dispatch:** 3 queue passes Ã— 2 inline channel tries = **6** HTTP attempts before DLQ.
+
+### Channel retries (inline)
+
+Fast, in-process retries for transient blips (timeout, momentary 503). Same queue pickup; 3s timeout per try.
+
+### Queue retries (abandon)
+
+Coarse, durable retry when the whole delivery pass fails. Message goes back on the dispatch queue.
+
+## `Failed` â†’ `Pending` in routing is **manual replay only**
+
+`PrepareDispatchesForRoutingAsync` resets `Failed` dispatches to `Pending` and republishes the outbox when the **same event is routed again** through the event queue.
+
+**Normal delivery failure does not hit this path.** After 3 delivery attempts, dispatch stays `Failed`; nothing re-enqueues the event automatically.
+
+This branch exists for **operational replay** (future â€œre-route this eventâ€ tooling), not automatic retry.
+
+## Consequences
+
+- **Pros:** Clear separationâ€”inline for blips, queue for bigger failures, routing replay for ops.
+- **Cons:** Nested retries multiply attempts; `Failed` reset without a replay cap could loop if something kept re-enqueueing the event (not implemented today).
+
+// ============================================================
+// docs\adrs\004-outbox-without-tenant-query-filter.md
+// ============================================================
+# ADR 004: Outbox excluded from EF tenant query filter
+
+**Scope:** `DispatchOutboxEntry`, `AppDbContext`, `DispatchOutboxRepository`, `DispatchOutboxPublisherService`
+
+## Context
+
+Most tenant-scoped entities (`NotificationMessage`, `NotificationDispatch`, `RoutingRule`) use an EF **global query filter** bound to `ITenantContext.CurrentTenantId`.
+
+`DispatchOutboxPublisherService` must drain unpublished outbox rows **across all tenants** in one poll (oldest first, batch of 50).
+
+## Options considered
+
+### A. Add query filter + per-tenant polling
+
+Add the same filter as dispatches; loop active tenants, set `CurrentTenantId`, query each.
+
+- **Pros:** ORM consistencyâ€”every tenant table filtered the same way.
+- **Cons:** N queries per poll cycle; more complex batching/ordering across tenants.
+
+### B. Add filter + `IgnoreQueryFilters` / admin scope on publisher
+
+- **Pros:** Filter exists for accidental reads elsewhere.
+- **Cons:** Publisher still bypasses it; `IgnoreQueryFilters` or admin scope is misleading ceremony.
+
+### C. No query filter on outbox (chosen)
+
+Outbox is **infrastructure**: a durable publish queue keyed by tenant on each row, but read globally by the publisher worker.
+
+- Routing writes outbox rows with `CurrentTenantId` set (mutation guard).
+- `MarkPublishedAsync` runs per tenant group with `CurrentTenantId` set.
+- `GetUnpublishedAsync` is intentionally cross-tenant.
+
+## Decision
+
+**Do not add an EF query filter on `DispatchOutboxEntry`.**
+
+Rows remain `ITenantScoped`; tenant is stamped on write. The exception is documented here and in code comments.
+
+**Future naming (optional):** rename `GetUnpublishedAsync` â†’ `GetUnpublishedAcrossTenantsAsync` to make the cross-tenant read explicit at the API boundary.
+
+## Consequences
+
+- **Pros:** Simple global drain; no admin scope or `IgnoreQueryFilters` on outbox reads.
+- **Cons:** One entity breaks â€œall tenant tables are filteredâ€ uniformityâ€”must be called out in review.
+- **Mitigation:** Explicit `TenantId` on rows; publisher groups by tenant before mark; routing queries outbox with explicit `TenantId` in `DispatchRepository`.
+
+// ============================================================
+// docs\adrs\005-in-memory-queues-and-backpressure.md
+// ============================================================
+# ADR 005: In-memory queues as stand-ins; backpressure in production
+
+**Scope:** `InMemoryMessageQueue`, `BackgroundService` processors, production ASB migration
+
+## Context
+
+`IEventQueue` and `IDispatchQueue` are implemented as **unbounded in-memory channels** with peek-lock semantics (complete / abandon). Background workers poll with ~100ms idle waits when empty.
+
+**Backpressure** is a common concern: what happens when ingest outpaces delivery?
+
+## What backpressure means
+
+When downstream (delivery) is slower than upstream (ingest), work piles up. **Backpressure** is the mechanism that slows or rejects upstream instead of absorbing infinite backlog.
+
+Today: ingest accepts events (subject to per-tenant rate limit), queues grow in memory, processors keep pollingâ€”**no signal from dispatch queue depth back to ingest**.
+
+## Decision (this codebase)
+
+**In-memory queues are intentional stand-ins**, not production topology.
+
+- Unbounded growth and RAM use under spike: **accepted at demo scope**.
+- Messages lost on process crash: **accepted** (see DESIGN.md).
+- 100ms idle polling: simulates worker loops, not production tuning.
+
+## Production (not implemented here)
+
+Replace with **Azure Service Bus** (or similar):
+
+- Durable backlog, horizontal scale-out of consumers.
+- `SessionId = TenantId` for tenant affinity.
+- Peek-lock / complete / abandon maps directly to current interfaces.
+
+ASB **does not eliminate** backpressureâ€”it **moves** backlog to the broker. You still care about:
+
+- Queue depth and oldest-message age (lag SLAs).
+- Cost and size limits at extreme depth.
+- Shedding load at ingest (429/503) or APIM when lag exceeds tolerance.
+
+**Existing partial backpressure:** per-tenant rate limit at ingest (429). It is **not** tied to dispatch queue depth or delivery lag.
+
+## Consequences
+
+- **Pros:** Runnable locally in one process; queue contracts (`IMessageQueue<T>`) swap cleanly.
+- **Cons:** No durability, no depth-based flow control, not scale-out safe.
+- ASB handles **durability and scale-out**, not unbounded lag toleranceâ€”queue depth, oldest-message age, and load shedding at ingest remain design concerns.
+
+// ============================================================
+// docs\adrs\006-delivery-rate-limit-deferral.md
+// ============================================================
+# ADR 006: Delivery rate-limit deferral is not a failed attempt
+
+**Scope:** `DeliveryProcessorService`, `RateLimitDeferralDurationToStopHotLooping`, `InMemoryMessageQueue.AbandonAsync`
+
+## Context
+
+Rate limiting applies at **two choke points**:
+
+1. **Ingest** â€” reject with 429 before enqueue (`IngestionService`).
+2. **Delivery** â€” tenant window may still be full when many dispatches fire at once.
+
+When delivery hits the limit, we must not spin in a tight loop re-reading the same dispatch item.
+
+## Decision
+
+On `AcquireResult.RateLimitExceeded` at delivery:
+
+1. **Return before** `dispatch.DeliveryAttempts++` â€” does **not** count toward max delivery attempts (3).
+2. **Abandon** the queue item with `RateLimitConstants.DeliveryDeferralDurationToStopHotLooping` (3 seconds).
+
+In-memory queue: message sits in a delayed list until `UtcNow + delay`, then returns to the channel. Stand-in for ASB `ScheduledEnqueueTimeUtc` or visibility timeout.
+
+## Why not increment delivery attempts?
+
+Rate limit is **expected backpressure**, not channel failure. Burning retry budget on â€œtenant is busyâ€ would dead-letter dispatches that would succeed moments later.
+
+## Why a delay at all?
+
+Without deferral, abandon immediately re-enqueues and the worker hot-loops on the same rate-limited item.
+
+## Consequences
+
+- **Pros:** Clear semantics; delivery retries reserved for real send failures.
+- **Cons:** 3s delay is arbitrary; in-memory timer is not true lock expiry.
+
+// ============================================================
+// docs\adrs\007-two-queue-architecture.md
+// ============================================================
+# ADR 007: Two-queue architecture (event queue vs dispatch queue)
+
+**Scope:** `IEventQueue`, `IDispatchQueue`, pipeline processors, `DESIGN.md` pipeline section
+
+## Context
+
+An ingested event may fan out to multiple channels (Slack, Teams, â€¦). We could model the whole flow on **one queue**â€”each message carries â€œdeliver to channel Xâ€â€”or split work across stages.
+
+## Decision
+
+Use **two queues** with distinct responsibilities:
+
+| Queue | Payload | Producer | Consumer | Work |
+|-------|---------|----------|----------|------|
+| **Event** | `ProcessingMessage` | `IngestionService` | `EventRoutingProcessorService` | Match rules, write DB, outbox |
+| **Dispatch** | `DispatchMessage` | `DispatchOutboxPublisherService` | `DeliveryProcessorService` | Rate limit, send, per-channel retry/DLQ |
+
+Between them: transactional outbox + DB (`NotificationMessage`, `NotificationDispatch`) â€” see [ADR 001](001-transactional-outbox-for-dispatch-publish.md).
+
+## Why not one queue?
+
+- **Independent failure domains:** routing failure dead-letters the event; delivery failure dead-letters one dispatchâ€”other channels for the same event continue.
+- **Separation of concerns:** routing (DB-heavy, rule matching) vs delivery (HTTP-heavy, channel retries).
+- **Independent scaling:** scale routing workers vs delivery workers (ASB: separate processors / session handlers).
+- **Different retry semantics:** event routing retries (max 3) vs dispatch delivery retries (max 3) vs channel inline retries (max 2)â€”see [ADR 003](003-dispatch-retry-layers-and-failed-status.md).
+- **Outbox fits naturally** between â€œfan-out decidedâ€ and â€œsend to channel.â€
+
+## Consequences
+
+- **Pros:** Clear pipeline story; matches how teams operate notification systems at scale.
+- **Cons:** More moving parts than a single queue; must keep DB, outbox, and dispatch queue consistent (outbox addresses routingâ†’dispatch handoff).
+- **Production:** `IEventQueue` / `IDispatchQueue` swap to ASB topics or queues; `SessionId = TenantId` on both for tenant affinity.
+
+// ============================================================
+// docs\adrs\008-deterministic-dispatch-ids.md
+// ============================================================
+# ADR 008: Deterministic dispatch IDs
+
+**Scope:** `DispatchMessage.CreateId`, `PrepareDispatchesForRoutingAsync`, `NotificationDispatch`
+
+## Context
+
+Events can be **redelivered** on the event queue (abandon after transient routing failure, crash before complete). Without stable dispatch identity, each retry could create new dispatch rows and duplicate channel sends for rules that already succeeded.
+
+## Decision
+
+Dispatch Id is **deterministic** from `(OriginalMessageId, RuleId)`:
+
+```csharp
+// SHA256(originalMessageId bytes || ruleId bytes) â†’ Guid (first 16 bytes)
+DispatchMessage.CreateId(message.Id, rule.Id)
+```
+
+The same event + rule always maps to the same `NotificationDispatch` and `DispatchOutboxEntry` Id.
+
+This was a pragmatic choice for the time budget: the schema already uses `Guid` primary keys, queue payloads carry a single `Id`, and redelivery needed a **stable** lookup key â€” not a formally chosen idempotency standard.
+
+## Alternatives considered
+
+| Approach | Why not (for this scope) |
+|----------|---------------------------|
+| **`Guid.NewGuid()` per fan-out** | Simple, but event redelivery creates new rows; `Succeeded` skip logic never fires; duplicate channel sends. |
+| **Composite PK `(OriginalMessageId, RuleId)`** | Correct in SQL, but everything else already keys off one `Guid` (dispatch queue, outbox, DLQ, logs). Would add a second identifier everywhere or refactor PK shape. |
+| **Random PK + separate idempotency column** | Same stable-key idea, extra column and â€œlookup by natural key, mutate by surrogateâ€ â€” more moving parts for the same behavior. |
+| **`Guid.CreateVersion5` (RFC 4122)** | Same deterministic-UUID pattern, more idiomatic than rolling SHA256. Chosen approach is equivalent in intent; SHA256 was quick and good enough. |
+| **Unique constraint + catch duplicate on insert** | Reactive; still need a stable id for queue messages and correlation; doesnâ€™t replace â€œcompute the same id on retry.â€ |
+
+**What we optimized for:** one `Guid` that fits existing tables, survives queue redelivery, and lets routing upsert/skip by primary key without a dedupe table.
+
+## Behavior on event redelivery
+
+`PrepareDispatchesForRoutingAsync` loads existing dispatches by Id and branches:
+
+| Existing status | Action |
+|-----------------|--------|
+| `Succeeded` | Skip â€” channel already delivered |
+| `Pending` | Orphan recovery or wait for outbox publisher |
+| `Failed` | Manual replay only â€” reset to `Pending`, republish outbox ([ADR 003](003-dispatch-retry-layers-and-failed-status.md)) |
+| (none) | Insert new dispatch + outbox |
+
+## Consequences
+
+- **Pros:** Idempotent fan-out on event retry; no duplicate rows for completed channels; dispatch Id doubles as correlation id end-to-end.
+- **Cons:** Id is not a sequential or human-readable identifier; rule change semantics (same rule Id, different config) still reuse the same dispatch row (i.e., updating the rule and re-running the message wouldn't work).
+- **Related:** Does not solve post-send duplicate delivery ([ADR 002](002-at-least-once-delivery.md))â€”that is a delivery-layer concern.
+
+// ============================================================
+// docs\adrs\009-tenant-isolation-fail-closed.md
+// ============================================================
+# ADR 009: Tenant isolation (fail-closed, shared schema)
+
+**Scope:** `ITenantContext`, `AppDbContext`, repositories, background processors, [ADR 004](004-outbox-without-tenant-query-filter.md)
+
+## Context
+
+Multi-tenant notification router: one deployment serves many tenants. Data leaks between tenants are unacceptable. Options include schema-per-tenant, row-level security only, or application-layer isolation.
+
+## Decision
+
+**Shared schema, row-level tenant id, fail-closed application guards.**
+
+### Four layers
+
+1. **Repositories** â€” queries take explicit `tenantId` (defense in depth).
+2. **EF global query filters** â€” on `RoutingRule`, `NotificationMessage`, `NotificationDispatch`; bound to scoped `ITenantContext`. No context â†’ **empty results** (not all rows).
+3. **`SaveChanges` mutation guard** â€” tenant-scoped writes require `CurrentTenantId` (stamps `TenantId` from context) or explicit `IsAdminScope` for cross-tenant admin operations.
+4. **`TenantSessionContextInterceptor` stub** â€” no-op on SQLite; production would set SQL session context for Azure SQL RLS.
+
+### Background workers
+
+Each processor groups work by tenant, opens a fresh DI scope, sets `CurrentTenantId = group.Key`, then reads/writes. Same pattern in event routing, outbox publish (mark published), and delivery.
+
+**Exception:** `DispatchOutboxEntry` has **no** query filterâ€”the publisher drains unpublished rows across tenants ([ADR 004](004-outbox-without-tenant-query-filter.md)). Rows are still tenant-stamped; writes use `CurrentTenantId` per group.
+
+### Alternatives considered (not chosen as default)
+
+| Approach | Why not default |
+|----------|-----------------|
+| **Schema-per-tenant** | Every migration, provision, and query becomes tenant-aware; heavy for a router serving many small tenants. |
+| **Database-per-tenant** | Stronger isolation, but same provisioning/ops scaling problem at high tenant count. |
+| **Deployment-per-tenant (IaC)** | Same app can run on a dedicated stack (own compute, DB, Service Bus, secrets) provisioned from a template. Viable for **enterprise customers** who contract and pay for hard isolationâ€”not the product default. Ops and cost scale with tenant count; shared pool + row-level guards is the right baseline. |
+
+This codebase targets the **shared** model. Dedicated IaC is a back-pocket **tier escalation** (compliance, data residency, noisy-neighbor at infra layer), not a rewriteâ€”same containers, different boundary.
+
+### `IsAdminScope`
+
+Reserved for legitimate cross-tenant admin reads (e.g. future admin API). **Not** used by the outbox publisherâ€”we use per-tenant grouping instead.
+
+## Consequences
+
+- **Pros:** Strong default isolation; hard to accidentally query another tenantâ€™s data; workers mirror request-scoped patterns.
+- **Cons:** Outbox is a deliberate filter exception; DEBUG builds throw on unscoped queries to filtered tables (`UnscopedTenantQueryInterceptor`).
+- **Production:** Pair ORM filters with Azure SQL RLS for defense in depth.
+
+// ============================================================
+// docs\adrs\010-parent-message-status-aggregation.md
+// ============================================================
+# ADR 010: Parent message status aggregation
+
+**Scope:** `NotificationMessage.Status`, `DeliveryProcessorService.UpdateParentMessageStatusAsync`
+
+## Context
+
+One ingested event fans out to multiple dispatches (e.g. Slack + Teams). Each dispatch succeeds or fails independently. The parent `NotificationMessage` needs a single status for API/audit once we know the outcome.
+
+## Decision
+
+After each dispatch reaches a **terminal** state (`Succeeded` or `Failed`), `UpdateParentMessageStatusAsync` runs:
+
+1. Load all dispatches for `(TenantId, OriginalMessageId)`.
+2. If **any** dispatch is still `Pending` â†’ **do not update** parent (still in flight).
+3. Otherwise aggregate:
+
+| Condition | Parent status |
+|-----------|---------------|
+| All dispatches `Succeeded` | `Dispatched` |
+| Mix of `Succeeded` and `Failed` | `PartiallyDispatched` |
+| All dispatches `Failed` | `DeliveryFailed` |
+
+When any failed: set `failureReason` to e.g. `"1 of 2 channel dispatch(es) failed."`
+
+### Earlier lifecycle (not aggregated here)
+
+- `Processing` â€” routing started (`EnsureProcessingAsync`)
+- `FanOutComplete` â€” routing finished, dispatches scheduled via outbox
+- `DeadLettered` â€” event-level DLQ during routing (no rules, inactive tenant, max routing retries)
+
+## Rationale for `DeliveryFailed` vs `PartiallyDispatched`
+
+**All failed** means the notification never reached any channelâ€”different from â€œsome channels worked.â€ Callers and ops can treat `DeliveryFailed` as a total miss.
+
+## Consequences
+
+- **Pros:** Clear parent semantics; partial success is visible; aggregation waits until no `Pending` dispatches remain.
+- **Cons:** Parent status lags slowest channel; concurrent dispatch completions may race (last writer wins on parent updateâ€”acceptable at this scope).
+- **Per-channel DLQ:** One channel failing does not dead-letter the event or other channels.
+
+// ============================================================
+// docs\adrs\011-shared-ingest-and-delivery-rate-limiting.md
+// ============================================================
+# ADR 011: Shared ingest and delivery rate limiting
+
+**Scope:** `RateLimiterService`, `IngestionService`, `DeliveryProcessorService`, `RateLimitConstants`, `ChannelTypes`
+
+## Context
+
+Per-tenant rate limiting applies at:
+
+1. **Ingest** â€” reject with 429 before enqueue.
+2. **Delivery** â€” defer dispatch queue item (does not consume delivery attempts; see [ADR 006](006-delivery-rate-limit-deferral.md)).
+
+Both call `TryAcquire` on the **same** `SlidingWindowRateLimiter` per tenant (`RateLimitPerMinute`).
+
+Fan-out multiplies pressure: one ingested event can produce multiple dispatch items (Slack + Teams), each consuming another permit at delivery.
+
+## Decision (current)
+
+**Single shared limiter per tenant** â€” demo simplicity, one knob on `Tenant.RateLimitPerMinute`.
+
+Deferral duration when delivery is rate-limited: **3 seconds** (`RateLimitConstants.DeliveryDeferralDurationToStopHotLooping`). Reduces hot-loop frequency vs 3s; does **not** solve sustained overload or queue depth growth ([ADR 005](005-in-memory-queues-and-backpressure.md)).
+
+### Tripwire for future changes
+
+`RateLimitSurfaceAreaTests` reflects over `ChannelTypes` public string constants, multiplies by `PermitsConsumedPerChannel`, and fails if the result exceeds `MaxRateLimitSurfaceArea`. Adding a channel (e.g. Discord) without bumping the max forces a deliberate re-read of this ADR.
+
+## Under sustained load
+
+1. Ingest fills window â†’ 429 on new events.
+2. Already-accepted events fan out to dispatch queue.
+3. Delivery hits same window â†’ defer 3s, repeat [this can happen indefinitely - see Production alternative for solution]
+4. Dispatch queue depth grows until window slides or load drops.
+
+## Production alternative (not implemented)
+
+Split limiters: **ingest budget** (events/min) vs **outbound budget** (sends/min, sized for fan-out). Or APIM at ingest + worker limit at delivery.
+
+**Deferral retry limit:** Currently a rate-limited dispatch defers indefinitely â€” `DeliveryAttempts` is never incremented on deferral, so the dead-letter threshold is never reached. Under sustained overload a dispatch item loops in the 3s cycle forever. A production system would want a separate deferral counter (distinct from delivery attempts) with a cap, after which the item is dead-lettered with a `RateLimitDeferralExceeded` reason rather than cycling forever.
+
+## Consequences
+
+- **Pros:** One limit to configure; tripwire prevents silent proliferation of shared acquire sites.
+- **Cons:** Ingest and delivery compete; 3s defer is anti-hot-loop only; fan-out not reflected in ingest cap.
+- **When adding a channel:** Bump `MaxRateLimitSurfaceArea`, update this ADR, and consider split limiters.
+
+// ============================================================
+// docs\adrs\012-cosmosdb-partition-key-no-rls.md
+// ============================================================
+# ADR 012: Azure Cosmos DB evaluated and rejected as primary store
+
+**Scope:** `AppDbContext`, `TenantSessionContextInterceptor`, [ADR 001](001-transactional-outbox-for-dispatch-publish.md), [ADR 009](009-tenant-isolation-fail-closed.md), [ADR 004](004-outbox-without-tenant-query-filter.md)
+
+## Context
+
+Azure Cosmos DB for NoSQL is a natural fit for a multi-tenant SaaS workload: `TenantId` as a partition key gives physical data locality, the service is fully managed, and it scales per-partition automatically. It was evaluated as the backing store for this system.
+
+## Decision
+
+**Do not use Azure Cosmos DB. Use a relational store (Azure SQL) as the production target.**
+
+## Reasons
+
+### 1. The outbox pattern requires multi-entity transactions
+
+ADR 001's core guarantee is that `NotificationDispatch` rows and `DispatchOutboxEntry` rows are written in a **single atomic commit**. This prevents split-brain between the dispatch record and the queue payload.
+
+Cosmos DB supports multi-document transactions only within a single partition of a single container. `NotificationDispatch` and `DispatchOutboxEntry` are different entity types that would live in different containers â€” a cross-container transaction is not possible. Workarounds (combining them into one container, or accepting eventual consistency between the two writes) both undermine the invariant the outbox is designed to enforce.
+
+### 2. No Row-Level Security equivalent
+
+ADR 009 Layer 4 is a `TenantSessionContextInterceptor` stub that in production would call `sp_set_session_context` on Azure SQL, enabling RLS as a **database-enforced backstop**: even a compromised application layer cannot read another tenant's rows without the session variable set.
+
+Cosmos DB has no equivalent. There is no RLS, no session context API, and no server-side predicate enforcement. The partition key provides structural data locality, but a cross-partition query with `EnableCrossPartitionQuery = true` returns all matching documents â€” the database does not reject it. Application-layer guards (ADR 009 Layers 1â€“3) would be the entire isolation story with no backstop, which is a weaker security posture for a multi-tenant system handling potentially sensitive notification payloads.
+
+### 3. The data model is inherently relational
+
+The pipeline relies on:
+
+- Foreign key relationships (`NotificationDispatch â†’ NotificationMessage â†’ RoutingRule`).
+- Aggregation queries across dispatches to compute parent message status ([ADR 010](010-parent-message-status-aggregation.md)).
+- The outbox drain ordering unpublished rows across tenants by `CreatedAt` ([ADR 004](004-outbox-without-tenant-query-filter.md)).
+
+These are natural SQL queries. Modeling them in Cosmos DB would require denormalisation, fan-out writes, or change feed consumers â€” all of which add complexity without adding value for a workload that is not document-oriented.
+
+### 4. Cosmos DB pricing is consumption-based in ways that penalise this pattern
+
+The outbox publisher polls unpublished rows on a short interval across all tenants. In Cosmos DB, cross-partition queries consume RUs proportional to the number of physical partitions scanned. At high tenant counts, a polling loop becomes expensive. Azure SQL charges for compute and storage, not per-query RU consumption, which is a better fit for a background worker that runs continuously.
+
+## What would make Cosmos DB appropriate
+
+If the workload shifted toward:
+
+- Document-shaped payloads with no cross-entity transactions.
+- Extremely high write throughput per tenant that saturates SQL.
+- A requirement for global multi-region writes (Cosmos DB multi-master).
+
+â€¦then Cosmos DB would be worth revisiting, likely paired with a separate relational store for the transactional outbox.
+
+## Consequences
+
+- **Chosen path (Azure SQL):** Supports multi-entity transactions, RLS via session context (ADR 009 Layer 4), natural joins and aggregations, and familiar EF migration tooling.
+- **Trade-off accepted:** Manual horizontal sharding if a single tenant grows to a scale that saturates one SQL instance; mitigated by the deployment-per-tenant tier described in ADR 009.
+- **This ADR is a record of rejection, not a recommendation to revisit** without addressing the transaction and RLS gaps above.
+
+// ============================================================
+// docs\adrs\013-observability.md
+// ============================================================
+# ADR 013: Observability â€” structured logging, distributed tracing, and metrics
+
+**Scope:** `IngestionService`, `EventRoutingProcessorService`, `DispatchOutboxPublisherService`, `DeliveryProcessorService`, `InMemoryDeadLetterQueue`, `ProcessingMessage`, `DispatchMessage`
+
+## Context
+
+The pipeline is fully async across four stages separated by durable queues:
+
+```
+POST /api/events â†’ [Event Queue] â†’ EventRoutingProcessorService
+  â†’ [Dispatch Queue] â†’ DeliveryProcessorService â†’ Slack / Teams
+```
+
+In production this is:
+
+- **Event queue / dispatch queue:** Azure Service Bus (ASB) sessions, one session per tenant.
+- **Dead-letter queue:** ASB built-in DLQ per queue.
+- **Database:** Azure Cosmos DB (see [ADR 012](012-cosmosdb-partition-key-no-rls.md)) or Azure SQL.
+- **Compute:** Azure Container Apps or AKS; multiple instances of each processor.
+
+Currently there is no correlation ID propagation across queue hops, no structured log enrichment with pipeline context, no metrics, and no distributed trace that spans all four stages. A message that enters the pipeline is invisible until it reaches a terminal state or is inspected in the database. DLQ entries are silent.
+
+This ADR covers what observability must look like for a production deployment, recognising that the in-process queues in the current codebase are stand-ins.
+
+## Decision
+
+**Adopt OpenTelemetry (OTel) SDK with three signals â€” traces, metrics, logs â€” exported to Azure Monitor. Use `MessageId` as the root correlation unit propagated via W3C `traceparent` on ASB message properties.**
+
+---
+
+### Distributed tracing
+
+#### Instrumentation points
+
+| Stage | `ActivitySource` span name | Key attributes |
+|-------|---------------------------|----------------|
+| Ingest | `mn.ingest` | `tenant.id`, `message.id`, `event.type` |
+| Event routing | `mn.route` | `tenant.id`, `message.id`, `rule.count` |
+| Outbox publish | `mn.outbox.publish` | `tenant.id`, `dispatch.id` |
+| Delivery | `mn.deliver` | `tenant.id`, `dispatch.id`, `channel.type`, `attempt` |
+
+#### Cross-queue context propagation
+
+ASB supports arbitrary `ApplicationProperties` on messages. The root `Activity.Id` (W3C `traceparent`) from ingest is written to the ASB message as `traceparent` (and `tracestate` if set). Each downstream processor reads the property, creates a child `Activity` with the remote parent context, and continues the trace.
+
+`ProcessingMessage` and `DispatchMessage` carry a `TraceContext` string property for this. The in-memory queue ignores it today; the ASB consumer would call `ActivityContext.TryParse` before creating its span.
+
+This produces a single end-to-end distributed trace per ingested event, visible in Azure Monitor Application Insights as a transaction with four child spans across potentially four separate process instances.
+
+#### DLQ traces
+
+Any message dead-lettered at the event or dispatch level emits a span with `error = true`, `dlq.reason`, and the full exception if present. ASB DLQ messages are then traceable back to the originating ingest trace.
+
+---
+
+### Structured logging
+
+All `ILogger` calls use `BeginScope` with a dictionary that includes:
+
+```csharp
+{ "TenantId", tenantId }
+{ "MessageId", messageId }
+{ "DispatchId", dispatchId }   // delivery stage only
+{ "Stage", "ingest|route|outbox|deliver" }
+```
+
+This ensures every log line emitted during processing of a specific message carries the same correlation fields, queryable in Log Analytics with:
+
+```kusto
+AppTraces
+| where Properties.MessageId == "<id>"
+| order by TimeGenerated asc
+```
+
+Log levels follow standard conventions: `Information` for normal pipeline progress, `Warning` for retried operations and rate-limit hits, `Error` for DLQ entries and terminal failures.
+
+---
+
+### Metrics
+
+Using `System.Diagnostics.Metrics` (`Meter` / `Counter` / `Histogram`), exported via OTel to Azure Monitor custom metrics.
+
+| Metric | Type | Dimensions |
+|--------|------|------------|
+| `mn.events.ingested` | Counter | `tenant_id`, `event_type` |
+| `mn.events.routed` | Counter | `tenant_id` |
+| `mn.dispatches.attempted` | Counter | `tenant_id`, `channel_type` |
+| `mn.dispatches.succeeded` | Counter | `tenant_id`, `channel_type` |
+| `mn.dispatches.failed` | Counter | `tenant_id`, `channel_type` |
+| `mn.ratelimit.hits` | Counter | `tenant_id`, `stage` (`ingest`\|`delivery`) |
+| `mn.dlq.entries` | Counter | `tenant_id`, `entry_type` (`event`\|`dispatch`) |
+| `mn.dispatch.latency` | Histogram (ms) | `tenant_id`, `channel_type` |
+| `mn.ingest_to_delivery.latency` | Histogram (ms) | `tenant_id` |
+
+`mn.ingest_to_delivery.latency` is the wall-clock delta from `NotificationMessage.CreatedAt` to `NotificationDispatch` reaching a terminal state â€” end-to-end pipeline latency per tenant.
+
+---
+
+### Health checks (`IHealthCheck`)
+
+Registered on the `/healthz` endpoint, used by Container Apps / AKS liveness and readiness probes:
+
+| Check | Readiness | Liveness |
+|-------|-----------|---------|
+| Database connectivity (Cosmos DB / Azure SQL) | Yes | Yes |
+| ASB namespace reachability | Yes | No |
+| Event queue depth < configurable threshold | Yes | No |
+| Dispatch queue depth < configurable threshold | Yes | No |
+| DLQ depth = 0 (degraded, not unhealthy) | Yes | No |
+
+Queue depth checks use the ASB Management Client (`ServiceBusAdministrationClient`). A non-zero DLQ depth marks readiness as `Degraded` â€” the service continues running but triggers an Azure Monitor alert.
+
+---
+
+### Alerting baselines (Azure Monitor)
+
+| Signal | Condition | Severity |
+|--------|-----------|---------|
+| `mn.dlq.entries` | Any increment | 2 (Error) |
+| `mn.ratelimit.hits{stage=ingest}` | > N/min per tenant | 3 (Warning) |
+| `mn.dispatch.latency` P99 | > 30s | 2 (Error) |
+| DLQ depth (ASB built-in) | > 0 for 5 min | 1 (Critical) |
+| Health check degraded | Consecutive failures | 2 (Error) |
+
+---
+
+### Wire-up in `Program.cs`
+
+```csharp
+builder.Services
+    .AddOpenTelemetry()
+    .WithTracing(t => t
+        .AddSource("MorrowNotifications")
+        .AddAzureMonitorTraceExporter())
+    .WithMetrics(m => m
+        .AddMeter("MorrowNotifications")
+        .AddAzureMonitorMetricExporter())
+    .WithLogging(l => l
+        .AddAzureMonitorLogExporter());
+```
+
+No changes to business logic are required beyond adding `BeginScope` enrichment and `ActivitySource.StartActivity` calls at stage entry points.
+
+---
+
+## Consequences
+
+- **Pros:** Single `MessageId` threads all log lines, spans, and metrics for one event across four async stages and multiple process instances; rate-limit and DLQ pressure surfaces before it becomes an incident; OTel SDK is vendor-neutral â€” exporter swap (e.g. Datadog) requires no code changes.
+- **Cons:** W3C context propagation requires `traceparent` in ASB `ApplicationProperties` â€” the in-memory queue stand-in does not propagate this today; `ProcessingMessage` and `DispatchMessage` need a `TraceContext` property added before the ASB producer/consumer is wired up.
+- **Current gap:** `InMemoryDeadLetterQueue` (`ConcurrentBag`) has no persistence, no replay, and no alerting. In production this is replaced by the ASB built-in DLQ; until then, DLQ entries are silent and the `mn.dlq.entries` counter is the only signal.
+
+// ============================================================
+// docs\adrs\014-dispatcher-abstraction.md
+// ============================================================
+# ADR 014: Dispatcher abstraction â€” `INotificationChannel` and `MessageDispatcher`
+
+**Scope:** `INotificationChannel`, `IMessageDispatcher`, `MessageDispatcher`, `SlackChannel`, `TeamsChannel`, `DeliveryProcessorService`, `ChannelTypes`
+
+## Context
+
+The spec requires that adding a new notification channel (email, SMS, webhook, etc.) does not require changes to the routing engine. The failure mode called out explicitly is "extensible in name only" â€” an interface that exists but forces every new channel to touch routing logic, add a switch statement, or modify `DeliveryProcessorService`.
+
+## Decision
+
+**Two-interface design: `INotificationChannel` is the channel seam; `IMessageDispatcher` encapsulates retry and dispatch orchestration.**
+
+### `INotificationChannel`
+
+```csharp
+public interface INotificationChannel
+{
+    string ChannelType { get; }
+    Task SendAsync(DispatchMessage dispatch, RoutingRule rule, CancellationToken ct);
+}
+```
+
+Each channel implementation declares its own string key via `ChannelType`. `SlackChannel` returns `"slack"`, `TeamsChannel` returns `"teams"`. The key matches `RoutingRule.ChannelType` â€” that string is the only coupling between the rule model and the channel implementations.
+
+### `MessageDispatcher` â€” route by key, not by type
+
+`MessageDispatcher` receives `IEnumerable<INotificationChannel>` via DI and builds a dictionary at construction time:
+
+```csharp
+_channels = channels.ToDictionary(c => c.ChannelType, StringComparer.OrdinalIgnoreCase);
+```
+
+Dispatch is a lookup, not a switch:
+
+```csharp
+if (!_channels.TryGetValue(rule.ChannelType, out var channel))
+    throw new InvalidOperationException(...);
+
+await channel.SendAsync(dispatch, rule, ct);
+```
+
+`DeliveryProcessorService` calls `IMessageDispatcher.DispatchAsync` and has no knowledge of individual channels. `MessageDispatcher` owns the inline retry loop (2 attempts, 3s timeout per attempt) â€” channel implementations do not need to handle retries themselves.
+
+### What adding a new channel actually requires
+
+1. Create a class that implements `INotificationChannel` in `MN.BusinessLogic` (or a separate assembly).
+2. Return the channel's string key from `ChannelType`.
+3. Register it with DI in `Program.cs`:
+   ```csharp
+   builder.Services.AddSingleton<INotificationChannel, EmailChannel>();
+   ```
+4. Add the key as a constant in `ChannelTypes` (optional but required to trigger the rate limit surface area tripwire â€” see [ADR 011](011-shared-ingest-and-delivery-rate-limiting.md)).
+
+No changes to `DeliveryProcessorService`, `MessageDispatcher`, `EventRoutingProcessorService`, or any routing logic.
+
+### Why `ChannelType` is a string, not an enum
+
+An enum would require modifying `ChannelTypes` (or the enum itself) and recompiling `MN.Core` each time a channel is added. A string key keeps the channel contract in the implementing class. `ChannelTypes` constants exist as a safe registry for known types and as the anchor for the rate limit surface area test â€” but they are not required by the interface.
+
+### Why `RoutingRule` carries `ChannelType` as a string
+
+The rule model stores the channel key as a plain string column. This means:
+
+- Rules survive new channel types without a schema migration.
+- A rule can reference a channel type that isn't yet deployed â€” the dispatcher throws at runtime, not at rule creation time.
+- No foreign key constraint to a channel registry table; channels are a deployment concern, not a data concern.
+
+The trade-off: invalid `ChannelType` values on rules are caught at dispatch time, not at rule creation time. Mitigation: the admin API validates `ChannelType` against `ChannelTypes` constants on write.
+
+## What `SendAsync` receives
+
+`SendAsync` gets the full `DispatchMessage` (tenant id, event type, payload, dispatch id) and the matched `RoutingRule`. The rule carries channel-specific config if needed â€” `RoutingRule` has commented-out `ChannelConfigs` and `PayloadCriteria` collections for this purpose. A webhook channel, for example, would read `rule.ChannelConfigs` for the target URL rather than requiring it in the payload.
+
+## Consequences
+
+- **Pros:** `DeliveryProcessorService` is fully closed to new channels; adding a channel is three lines of code + one registration; channel implementations are independently testable.
+- **Cons:** Invalid channel key on a rule surfaces at dispatch time rather than rule creation; no compile-time guarantee that a registered channel covers all enum values (doesn't apply â€” deliberately string-keyed).
+- **Production extension point:** webhook channel would read destination URL from `RoutingRule.ChannelConfigs`; SMS channel would read E.164 number from the same; neither requires a schema change to the core routing tables.
+
+// ============================================================
+// docs\adrs\015-routing-rule-model.md
+// ============================================================
+# ADR 015: Routing rule model â€” exact event type match, string channel key
+
+**Scope:** `RoutingRule`, `IRoutingRuleRepository`, `GetMatchingRulesAsync`, `EventRoutingProcessorService`, `RoutingRuleModels`
+
+## Context
+
+The spec says "be prepared to defend your choice" on the rule model. The minimum requirement is: for events matching X, dispatch to channel(s) Y. Both the expressiveness of X and the representation of Y are design decisions.
+
+## Decision
+
+**`RoutingRule` is a flat row: `(TenantId, EventType, ChannelType)` with a unique constraint. Matching is exact string equality on `EventType`. Fan-out is achieved by multiple rules for the same `EventType` pointing to different channels.**
+
+### What a rule looks like
+
+```
+TenantId:    <uuid>
+EventType:   "user.signup"
+ChannelType: "slack"
+IsActive:    true
+```
+
+A second rule `(same TenantId, "user.signup", "teams")` fans out the same event to Teams. The unique constraint on `(TenantId, EventType, ChannelType)` prevents duplicate rules per channel.
+
+### Why exact match
+
+**Simplicity and auditability.** For a notification router, operators need to see precisely what will fire for a given event type. Wildcard or regex rules introduce ambiguity ("does `user.*` cover `user.signup.invited`?") and ordering/priority questions ("which rule wins if two patterns match?"). Exact match has no edge cases: the rule either matches or it doesn't.
+
+**Production systems commonly use exact match.** PagerDuty routing rules, AWS EventBridge rules (before pattern matching was added), and most webhook routing tables default to exact event type strings. Teams graduate to pattern matching when they have proven the need.
+
+### What was considered and not chosen
+
+| Approach | Why not |
+|----------|---------|
+| **Regex / glob matching** | Ordering and priority questions; hard to audit; "which rules fire?" is no longer obvious at a glance; correct behavior requires a rule priority column and conflict resolution |
+| **Payload predicate matching** (`field == value`) | Requires a payload schema per event type; adds a criteria evaluation engine; worth it for alert routing, overkill for a notification dispatcher |
+| **Wildcard prefix** (`user.*`) | Simpler than regex but still introduces overlap ambiguity and requires a defined match-all priority |
+| **Topic/category hierarchy** | Maps well to a message bus but adds a separate concept (category) on top of event type without clear benefit |
+
+The commented-out `RoutingRulePayloadCriteria` collection on `RoutingRule` documents where payload-level matching would attach if requirements evolved â€” the schema extension point exists without forcing the complexity now.
+
+### Fan-out by multiple rules, not by array on a single rule
+
+An alternative model is a single rule with `ChannelTypes: ["slack", "teams"]`. The flat-row approach was chosen because:
+
+- Each rule has an independent `IsActive` flag â€” you can disable Slack delivery for an event type without touching the Teams rule.
+- Each dispatch gets its own `NotificationDispatch` row keyed by `(OriginalMessageId, RuleId)`. A multi-channel rule would need a sub-row per channel anyway, collapsing to the same shape.
+- Retry, DLQ, and status tracking are per-dispatch. Keeping rules 1:1 with dispatches makes the relationship straightforward.
+
+### `ChannelType` as a string, not a foreign key
+
+`RoutingRule.ChannelType` is a plain string, not a FK to a channel registry table. See [ADR 014](014-dispatcher-abstraction.md) for the full rationale. Short version: channels are a deployment concern; rules should not break when a new channel is added or an existing one is renamed.
+
+### Why we didn't over-specify the rule model
+
+The `RoutingRule` entity has commented-out `ChannelConfigs` and `PayloadCriteria` collections. The comment in the entity reads:
+
+> *"finalization subject to further requirements gathering â€” who are we building this for and why?"*
+
+This is the honest reason the model is minimal. A notification router for a DevOps alerting platform (many event types, fine-grained severity filtering, on-call escalation) needs payload predicates and rule priority. One for transactional emails (user.signup â†’ email, full stop) needs almost nothing. One for a multi-product SaaS (thousands of tenants, arbitrary event schemas) might need per-tenant rule templates and wildcard matching.
+
+Building any of those richer models speculatively â€” without knowing which product shape this is â€” means either locking in the wrong abstraction or building complexity that no tenant ever uses. Exact match with documented extension points is the minimum that is correct for the specified requirements, leaves the door open for any of the above, and doesn't force a schema migration or a rewrite of the routing engine to get there.
+
+The right time to add payload predicates is when a real tenant says "I need to route only critical alerts to PagerDuty." The right time to add wildcards is when a tenant has 30 event types and wants a catch-all rule. Neither of those conversations has happened yet.
+
+### What "exact match" would extend to first
+
+If the product needed richer matching, the lowest-cost first step is **prefix matching** on `EventType` with an explicit priority column. This covers the most common case ("all `user.*` events go to Slack") without a full expression evaluator. The `RoutingRulePayloadCriteria` extension point would come second, for cases like "only send to PagerDuty if `severity == critical`."
+
+## Consequences
+
+- **Pros:** Predictable and auditable; no priority resolution; operators can enumerate exactly which rules fire for any event; schema is minimal.
+- **Cons:** Exact match only â€” a tenant with 20 event types all routed to the same channel needs 20 rules; no wildcard shorthand.
+- **Known limitation acknowledged:** "Rules â€” exact `EventType` match only" is listed in DESIGN.md. The extension path is documented above and in the commented schema on `RoutingRule`.
+
+// ============================================================
+// docs\adrs\016-ingest-idempotency.md
+// ============================================================
+# ADR 016: Ingest idempotency â€” known gap at the API boundary
+
+**Scope:** `IngestionService`, `EventsController`, `ProcessingMessage`, `IMessageRepository.EnsureProcessingAsync`
+
+## Context
+
+`IngestionService.IngestAsync` assigns a new `Guid.NewGuid()` to every accepted event before enqueuing it. There is no idempotency key on `POST /api/events`.
+
+The failure mode: a client POSTs an event, the server processes it and returns `202 Accepted`, but the response is lost in transit (network drop, load balancer timeout, client crash). The client has no way to know whether the event was accepted. Standard practice is to retry â€” which creates a second, identical event in the pipeline with a different `MessageId`. Both will be routed and dispatched independently.
+
+This is a known gap, not an oversight. The spec explicitly says: *"Authentication is out of scope"* and the focus is on isolation, routing, and rate limiting. Idempotency at the API boundary falls outside the required scope. It is documented here because it is the kind of failure-mode question that comes up in a principal-level review.
+
+## What partial protection exists today
+
+`EnsureProcessingAsync` in `IMessageRepository` upserts `NotificationMessage` by `MessageId`. This protects against **queue redelivery** of the same message â€” if the event queue redelivers a `ProcessingMessage` that was already routed, routing is idempotent (deterministic dispatch IDs mean already-`Succeeded` dispatches are skipped â€” see [ADR 008](008-deterministic-dispatch-ids.md)).
+
+This does **not** help with the API boundary case: two separate `POST /api/events` calls produce two separate `MessageId` values and are treated as two distinct events end-to-end.
+
+## What a fix would look like
+
+**Client-supplied `Idempotency-Key` header** (standard pattern, used by Stripe, Braintree, etc.):
+
+1. Client generates a UUID per logical event and sends it as `Idempotency-Key: <uuid>`.
+2. Server stores `(TenantId, IdempotencyKey) â†’ MessageId` in a short-TTL cache (Redis) or a DB table with a TTL index.
+3. On a duplicate key, return the original `202` with the original `MessageId` â€” no second enqueue.
+4. TTL: 24 hours covers any realistic retry window; older keys are not stored.
+
+The `MessageId` in the response already gives clients a correlation handle. The only missing piece is accepting a client-supplied key at the boundary and deduplicating on it before `Guid.NewGuid()` is called.
+
+**Why not use the payload hash as the key?**  
+Payload-based deduplication conflates "same logical event" with "same payload content." Two separate `user.signup` events with identical payloads (e.g., a user deleted and re-created with the same email) would be incorrectly collapsed. A client-supplied key is explicit intent from the producer.
+
+## Current behaviour under retry
+
+Without a fix, a client that retries on timeout will produce duplicate notifications on all matched channels. Given that channels are Slack/Teams stubs today, the practical impact is a duplicate log line. Under real channels, this is a visible duplicate message â€” which [ADR 002](002-at-least-once-delivery.md) accepts as tolerable for the current scope.
+
+## Consequences
+
+- **Gap:** Client retry on timeout creates a duplicate event; no deduplication at the API boundary.
+- **Mitigation path:** `Idempotency-Key` header + short-TTL store; does not require changes to the pipeline below `IngestionService`.
+- **Not in scope for this submission** per the spec's time budget guidance â€” deferred to the known limitations list in DESIGN.md.
+

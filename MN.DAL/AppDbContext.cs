@@ -18,15 +18,23 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ITenantContext
         modelBuilder.Entity<Tenant>(e =>
         {
             e.HasKey(t => t.Id);
+
+            // maybe not necessary.  would help with devops notifications (e.g. 'Acme Corp' is down
+            // only means 1 thing).  also if you want to give tenants different URLs and use names
+            // as a slug.
             e.HasIndex(t => t.Name).IsUnique();
+
             e.Property(t => t.Name).IsRequired().HasMaxLength(200);
         });
 
         modelBuilder.Entity<RoutingRule>(e =>
         {
             e.HasKey(r => r.Id);
+
             // One rule per channel per event type — bounded multi-channel fan-out per ingest.
+            // stops tenant from footgunning with duplicate routing rules per channel per event type
             e.HasIndex(r => new { r.TenantId, r.EventType, r.ChannelType }).IsUnique();
+
             e.Property(r => r.EventType).IsRequired().HasMaxLength(200);
             e.Property(r => r.ChannelType).IsRequired().HasMaxLength(50);
             e.HasOne(r => r.Tenant)
@@ -38,7 +46,13 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ITenantContext
         modelBuilder.Entity<NotificationMessage>(e =>
         {
             e.HasKey(m => m.Id);
+
+            // quick status lookups.  "show me all my failed notifications" -> fast.
+            // might want to split this status out into two though, as the status is
+            // doing 2 jobs.  it shows the status of the notification and the status
+            // of the children at the same time, probably not good.
             e.HasIndex(m => new { m.TenantId, m.Status });
+            
             e.HasIndex(m => m.TenantId);
             e.Property(m => m.EventType).IsRequired().HasMaxLength(200);
             e.Property(m => m.Payload).IsRequired().HasMaxLength(NotificationLimits.MaxPayloadLength);

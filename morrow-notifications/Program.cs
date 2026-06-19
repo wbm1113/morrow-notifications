@@ -45,6 +45,11 @@ builder.Services.AddHostedService<DeliveryProcessorService>();
 
 var app = builder.Build();
 
+// when moving to redis, would remove this, move to lazy loading pattern
+// and delete this block.  i.e., try the cache, if it's missing, read rate
+// limit from db, write result to the cache, move on.  probably do per-instance
+// semaphore on the DB check so you don't cache stampede.  if you have a lot
+// of pods you'd want a distributed way of doing this
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();

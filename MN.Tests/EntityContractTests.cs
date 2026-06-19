@@ -8,6 +8,10 @@ public class EntityContractTests
     [Fact]
     public void AllEntitiesWithTenantId_MustImplementITenantScoped()
     {
+        // this is flawed.  there's a better way - EF exposes a list of all
+        // entities that FK to TenantId, we could drive off that instead of
+        // tenantId string matching
+
         var entityTypes = typeof(RoutingRule).Assembly
             .GetExportedTypes()
             .Where(t => t.IsClass && !t.IsAbstract)
@@ -23,4 +27,7 @@ public class EntityContractTests
             violations.Count == 0,
             $"The following types have a TenantId property but do not implement ITenantScoped: {string.Join(", ", violations)}");
     }
+
+    // there should be another test here that validates query filters exist
+    // on the tenant ID entities, excluding the outbox (that needs cross-tenant reads)
 }

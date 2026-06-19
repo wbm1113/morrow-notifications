@@ -32,6 +32,13 @@ public class DispatchOutboxRepository(AppDbContext db) : IDispatchOutboxReposito
                     .SetProperty(o => o.ClaimedBy, claimerId),
                 ct);
 
+        // TODO: ExecuteUpdateAsync only returns a row count, so we need a second round-trip to
+        // read back the rows we just claimed. These two operations are not atomic — a race between
+        // two publisher instances is theoretically possible between them, though the WHERE filter
+        // on ClaimedBy + ClaimedUntil makes a false positive read unlikely in practice. The real
+        // fix is a single `UPDATE … RETURNING *` (SQLite 3.35+ / PostgreSQL) or `OUTPUT` (SQL
+        // Server) via FromSqlRaw, which stamps and returns the rows in one atomic round-trip.
+        // EF has no first-class API for this today.
         return await db.DispatchOutbox
             .Where(o => o.ClaimedBy == claimerId
                         && o.PublishedAt == null
